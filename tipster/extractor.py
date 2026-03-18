@@ -177,6 +177,7 @@ async def extract_pending(
     # rows is a list of named tuples — all primitives, safe after session close
     pending_data = [(r.item_id, r.raw_text, r.url, r.prompt_snippet or "") for r in rows]
 
+    log.debug("EXTRACT PENDING  %d item(s) queued", len(pending_data))
     await bus.emit(
         Event(
             kind=EventKind.EXTRACT_START,
@@ -190,6 +191,7 @@ async def extract_pending(
     for item_id, raw_text, item_url, prompt_snippet in pending_data:
         if not budget.can_proceed():
             remaining = len(pending_data) - extracted_count
+            log.debug("EXTRACT DEFERRED  budget exhausted  remaining=%d", remaining)
             await bus.emit(
                 Event(
                     kind=EventKind.EXTRACT_DEFERRED,
@@ -198,6 +200,8 @@ async def extract_pending(
             )
             break
 
+        log.debug("EXTRACT START  item_id=%d  url=%s  text_len=%d  hint=%r",
+                  item_id, item_url, len(raw_text or ""), prompt_snippet or "")
         success, payload = await loop.run_in_executor(
             None,
             partial(extract_one, item_id, raw_text or "", cfg, budget, prompt_snippet),
@@ -208,12 +212,23 @@ async def extract_pending(
             content_repo = ContentItemRepo(db)
             if success:
                 data = json.loads(payload)
+                parsed = json.loads(data["extracted_json"])
                 content_repo.mark_extracted(
                     item_id=item_id,
                     extracted_json=data["extracted_json"],
                     article_sum_md=data["article_sum_md"],
                 )
                 extracted_count += 1
+                log.debug(
+                    "EXTRACT OK  item_id=%d  url=%s  page_type=%s  title=%r  "
+                    "facts=%d  entities=%d  summary_len=%d",
+                    item_id, item_url,
+                    parsed.get("page_type", "?"),
+                    parsed.get("title", "")[:80],
+                    len(parsed.get("key_facts", [])),
+                    len(parsed.get("entities", [])),
+                    len(data.get("article_sum_md", "")),
+                )
                 await bus.emit(
                     Event(
                         kind=EventKind.EXTRACT_OK,
@@ -224,8 +239,10 @@ async def extract_pending(
             else:
                 if "budget exhausted" in payload:
                     # Leave as pending_extraction for next slice
-                    pass
+                    log.debug("EXTRACT DEFERRED (budget)  item_id=%d  url=%s", item_id, item_url)
                 else:
+                    log.debug("EXTRACT FAILED  item_id=%d  url=%s  reason=%s",
+                              item_id, item_url, payload[:120])
                     from tipster.db.models import ContentItem as _CI
                     db.query(_CI).filter_by(item_id=item_id).update({"status": "failed"})
                     db.commit()
@@ -239,4 +256,5 @@ async def extract_pending(
         finally:
             db.close()
 
+    log.debug("EXTRACT PENDING DONE  extracted=%d / %d", extracted_count, len(pending_data))
     return extracted_count

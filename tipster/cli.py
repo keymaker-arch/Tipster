@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 from typing import Optional
@@ -18,6 +19,21 @@ console = Console()
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _setup_debug_logging(log_path: Path) -> None:
+    """Attach a DEBUG-level file handler to the tipster logger hierarchy."""
+    handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(
+        logging.Formatter(
+            fmt="%(asctime)s  %(levelname)-8s  %(name)-35s  %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    root_logger = logging.getLogger("tipster")
+    root_logger.setLevel(logging.DEBUG)
+    root_logger.addHandler(handler)
+    root_logger.info("Debug logging started — writing to %s", log_path)
 
 def _load_env_and_db(
     work_dir: Path,
@@ -277,7 +293,11 @@ def cmd_status(work_dir: str) -> None:
 
 @cli.command("start")
 @click.option("--dir", "work_dir", default=".", show_default=True)
-def cmd_start(work_dir: str) -> None:
+@click.option(
+    "--debug", "debug", is_flag=True, default=False,
+    help="Write detailed DEBUG-level logs to tipster-debug.log in the working directory.",
+)
+def cmd_start(work_dir: str, debug: bool) -> None:
     """Start the Tipster crawler service with TUI dashboard."""
     from tipster.config import load_config
     from tipster.db.session import init_db, get_db
@@ -288,6 +308,11 @@ def cmd_start(work_dir: str) -> None:
     from tipster.tui import TipsterApp
 
     wdir, yaml_path, db_path = _resolve_paths(work_dir)
+
+    if debug:
+        log_path = wdir / "tipster-debug.log"
+        _setup_debug_logging(log_path)
+        console.print(f"[dim]Debug logging → [bold]{log_path}[/bold][/dim]")
 
     if not yaml_path.exists():
         console.print("[red]tipster.yaml not found. Run `tipster init` first.[/red]")

@@ -67,9 +67,18 @@ async def _process_url(
     llm_sem: asyncio.Semaphore,
 ) -> None:
     """Fetch one URL, triage it, and persist results."""
+    log.debug("FETCH  url_id=%d  %s", url_id, url)
     await bus.emit(Event(kind=EventKind.CRAWL_START, url=url, message="fetching…"))
 
     result: CrawlResult = await fetch(url, default_delay=cfg.crawl.default_delay_seconds)
+    log.debug(
+        "FETCH DONE  url=%s  http=%s  ok=%s  text_len=%d  hash=%s",
+        url,
+        result.status_code,
+        result.ok,
+        len(result.text or ""),
+        result.content_hash[:16] if result.content_hash else "—",
+    )
 
     now = datetime.now(timezone.utc)
     relevant = False
@@ -110,6 +119,7 @@ async def _process_url(
                 check_interval=new_interval,
                 status=entry.status,  # keep current status
             )
+            log.debug("CRAWL ERROR  url=%s  error=%s", url, result.error or result.status_code)
             await bus.emit(
                 Event(
                     kind=EventKind.CRAWL_ERROR,
@@ -121,9 +131,35 @@ async def _process_url(
 
         stats.crawled_total += 1
 
+        # --- Empty content check ---
+        if not result.text:
+            new_interval = min(entry.check_interval * 2, 7 * 24 * 3600)
+            url_repo.update_after_crawl(
+                url_id=url_id,
+                last_checked=now,
+                next_check_at=_next_check_at(now, new_interval, entry.recrawl_type),
+                check_interval=new_interval,
+                status=entry.status,
+            )
+            log.debug("EMPTY CONTENT  url=%s  html_len=%d", url, len(result.raw_html))
+            await bus.emit(
+                Event(
+                    kind=EventKind.CRAWL_ERROR,
+                    url=url,
+                    message="empty content — no text extracted from page",
+                )
+            )
+            return
+
         # --- Novelty check (Phase 2: cross-URL deduplication) ---
         content_repo = ContentItemRepo(db)
         existing = content_repo.get_by_hash(result.content_hash)
+        log.debug(
+            "NOVELTY  url=%s  hash=%s  existing_item=%s",
+            url,
+            result.content_hash[:16],
+            existing.item_id if existing else "none",
+        )
 
         if existing is not None:
             if existing.url_id == url_id:
@@ -183,11 +219,19 @@ async def _process_url(
             return
 
         # --- Relevance triage (budget-gated) ---
+        log.debug(
+            "TRIAGE START  url=%s  budget=[tokens=%d cost=$%.4f]",
+            url, budget.tokens_used, budget.cost_usd,
+        )
         async with llm_sem:
             relevant, score, reason = await triage_async(result.text, cfg, budget)
         # Sync budget stats to CrawlStats for TUI display
         stats.tokens_used = budget.tokens_used
         stats.cost_usd = budget.cost_usd
+        log.debug(
+            "TRIAGE RESULT  url=%s  relevant=%s  score=%.4f  reason=%s  budget=[tokens=%d cost=$%.4f]",
+            url, relevant, score, reason, budget.tokens_used, budget.cost_usd,
+        )
 
         if "budget exhausted" in reason:
             await bus.emit(
@@ -235,13 +279,17 @@ async def _process_url(
         )
         is_new_source = (prior == 0)
 
-        content_repo.add(
+        saved_item = content_repo.add(
             topic_id=topic_id,
             url_id=url_id,
             content_hash=result.content_hash,
             raw_text=result.text,
             topic_score=score,
             is_new_source=is_new_source,
+        )
+        log.debug(
+            "SAVED  item_id=%d  url=%s  score=%.4f  is_new_source=%s  text_len=%d",
+            saved_item.item_id, url, score, is_new_source, len(result.text or ""),
         )
 
         new_interval = max(int(entry.check_interval * 0.75), 60)
@@ -273,6 +321,7 @@ async def _process_url(
 
     # --- Link discovery (Phase 3) — outside the DB session ---
     if result.ok and relevant and link_data:
+        log.debug("LINK DISCOVERY  source=%s  candidates=%d", url, len(link_data))
         from tipster.link_scorer import discover_links
         async with llm_sem:
             await discover_links(
@@ -286,6 +335,10 @@ async def _process_url(
             )
         stats.tokens_used = budget.tokens_used
         stats.cost_usd = budget.cost_usd
+        log.debug(
+            "LINK DISCOVERY DONE  source=%s  budget=[tokens=%d cost=$%.4f]",
+            url, budget.tokens_used, budget.cost_usd,
+        )
 
 
 class CrawlScheduler:
@@ -351,6 +404,9 @@ class CrawlScheduler:
 
         # Reset budget at the start of each slice
         self._budget.reset()
+        log.debug("SLICE START  budget reset  max_tokens=%d  max_cost=$%.2f",
+                  self._cfg.budget.max_tokens_per_slice,
+                  self._cfg.budget.max_cost_per_slice_usd)
 
         # Step 0: apply any pending directives from the previous feedback cycle
         await apply_directives(self._topic_id, self._cfg, self._bus)
@@ -358,15 +414,10 @@ class CrawlScheduler:
         # Step 1: score any links deferred from the previous slice
         await score_pending_links(self._topic_id, self._cfg, self._budget, self._bus)
 
-        # Step 2: extract any items that are pending from the previous slice
+        # Step 2: extract any items left pending from a previous interrupted run
         await extract_pending(self._cfg, self._topic_id, self._budget, self._bus)
-
-        # Sync budget stats
         self._stats.tokens_used = self._budget.tokens_used
         self._stats.cost_usd = self._budget.cost_usd
-
-        # Step 2.5: check if a report should be generated
-        await self._maybe_generate_report()
 
         # Step 3: crawl due URLs
         db = get_db()
@@ -380,6 +431,8 @@ class CrawlScheduler:
             await self._bus.emit(
                 Event(kind=EventKind.SCHEDULER_TICK, message="scheduler tick — no URLs due")
             )
+            # Still check for a report in case extraction in step 2 produced new items
+            await self._maybe_generate_report()
             return
 
         await self._bus.emit(
@@ -392,6 +445,7 @@ class CrawlScheduler:
         assert self._crawl_sem is not None
         assert self._llm_sem is not None
 
+        crawl_tasks: list[asyncio.Task] = []
         for entry in due:
             # Capture primitive values before the session might expire
             url_id = entry.url_id
@@ -413,6 +467,25 @@ class CrawlScheduler:
             task = asyncio.create_task(_guarded())
             self._active_tasks.add(task)
             task.add_done_callback(self._active_tasks.discard)
+            crawl_tasks.append(task)
+
+        # Wait for all crawl tasks to finish before extracting — this ensures
+        # content items saved by this batch are extracted immediately rather
+        # than waiting for the next scheduler tick.
+        log.debug("CRAWL BATCH  waiting for %d task(s) to complete", len(crawl_tasks))
+        await asyncio.gather(*crawl_tasks, return_exceptions=True)
+        log.debug("CRAWL BATCH DONE  budget=[tokens=%d cost=$%.4f]",
+                  self._budget.tokens_used, self._budget.cost_usd)
+
+        # Step 4: extract items that were just saved by this crawl batch
+        await extract_pending(self._cfg, self._topic_id, self._budget, self._bus)
+        self._stats.tokens_used = self._budget.tokens_used
+        self._stats.cost_usd = self._budget.cost_usd
+        log.debug("SLICE END  budget=[tokens=%d cost=$%.4f]",
+                  self._budget.tokens_used, self._budget.cost_usd)
+
+        # Step 5: check if a report should be generated now that new items are extracted
+        await self._maybe_generate_report()
 
     async def _maybe_generate_report(self) -> None:
         """Generate a report if the configured schedule requires it."""
