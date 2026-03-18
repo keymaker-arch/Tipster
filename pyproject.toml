@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tipster"
+version = "0.1.0"
+description = "LLM-Powered Autonomous Web Intelligence Crawler"
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.0",
+    "rich>=13.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "sqlalchemy>=2.0",
+    "litellm>=1.0",
+    "httpx>=0.24",
+    "trafilatura>=1.6",
+    "beautifulsoup4>=4.12",
+    "python-dotenv>=1.0",
+    "ruamel.yaml>=0.18",
+    "celery>=5.3",
+    "redis>=5.0",
+    "textual>=0.47",
+]
+
+[project.scripts]
+tipster = "tipster.cli:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["tipster"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
