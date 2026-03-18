@@ -28,6 +28,20 @@ from tipster.triage import triage_async
 
 log = logging.getLogger("tipster.scheduler")
 
+# Sentinel used for one_time URLs so they are never re-queued by list_due
+_FAR_FUTURE = datetime(9999, 1, 1, tzinfo=timezone.utc)
+
+
+def _next_check_at(now: datetime, interval_secs: int, recrawl_type: str) -> datetime:
+    """Return the next scheduled crawl time.
+
+    For one_time URLs this is always _FAR_FUTURE, effectively retiring the URL
+    after its first fetch regardless of content outcome.
+    """
+    if recrawl_type == "one_time":
+        return _FAR_FUTURE
+    return now + timedelta(seconds=interval_secs)
+
 
 class CrawlStats:
     """Mutable stats shared between scheduler and TUI."""
@@ -50,6 +64,7 @@ async def _process_url(
     bus: EventBus,
     stats: CrawlStats,
     budget: BudgetGate,
+    llm_sem: asyncio.Semaphore,
 ) -> None:
     """Fetch one URL, triage it, and persist results."""
     await bus.emit(Event(kind=EventKind.CRAWL_START, url=url, message="fetching…"))
@@ -68,11 +83,12 @@ async def _process_url(
             return
 
         if result.inaccessible:
+            new_interval = entry.check_interval * 2
             url_repo.update_after_crawl(
                 url_id=url_id,
                 last_checked=now,
-                next_check_at=now + timedelta(seconds=entry.check_interval * 2),
-                check_interval=entry.check_interval * 2,
+                next_check_at=_next_check_at(now, new_interval, entry.recrawl_type),
+                check_interval=new_interval,
                 status="inaccessible",
             )
             await bus.emit(
@@ -90,7 +106,7 @@ async def _process_url(
             url_repo.update_after_crawl(
                 url_id=url_id,
                 last_checked=now,
-                next_check_at=now + timedelta(seconds=new_interval),
+                next_check_at=_next_check_at(now, new_interval, entry.recrawl_type),
                 check_interval=new_interval,
                 status=entry.status,  # keep current status
             )
@@ -116,7 +132,7 @@ async def _process_url(
                 url_repo.update_after_crawl(
                     url_id=url_id,
                     last_checked=now,
-                    next_check_at=now + timedelta(seconds=new_interval),
+                    next_check_at=_next_check_at(now, new_interval, entry.recrawl_type),
                     check_interval=new_interval,
                     status="active",
                 )
@@ -153,7 +169,7 @@ async def _process_url(
                 url_repo.update_after_crawl(
                     url_id=url_id,
                     last_checked=now,
-                    next_check_at=now + timedelta(seconds=new_interval),
+                    next_check_at=_next_check_at(now, new_interval, entry.recrawl_type),
                     check_interval=new_interval,
                     status="active",
                 )
@@ -167,7 +183,8 @@ async def _process_url(
             return
 
         # --- Relevance triage (budget-gated) ---
-        relevant, score, reason = await triage_async(result.text, cfg, budget)
+        async with llm_sem:
+            relevant, score, reason = await triage_async(result.text, cfg, budget)
         # Sync budget stats to CrawlStats for TUI display
         stats.tokens_used = budget.tokens_used
         stats.cost_usd = budget.cost_usd
@@ -188,7 +205,7 @@ async def _process_url(
             url_repo.update_after_crawl(
                 url_id=url_id,
                 last_checked=now,
-                next_check_at=now + timedelta(seconds=new_interval),
+                next_check_at=_next_check_at(now, new_interval, entry.recrawl_type),
                 check_interval=new_interval,
                 status="active",
             )
@@ -231,7 +248,7 @@ async def _process_url(
         url_repo.update_after_crawl(
             url_id=url_id,
             last_checked=now,
-            next_check_at=now + timedelta(seconds=new_interval),
+            next_check_at=_next_check_at(now, new_interval, entry.recrawl_type),
             check_interval=new_interval,
             status="active",
             is_new_source=is_new_source,
@@ -257,14 +274,15 @@ async def _process_url(
     # --- Link discovery (Phase 3) — outside the DB session ---
     if result.ok and relevant and link_data:
         from tipster.link_scorer import discover_links
-        await discover_links(
-            link_data=link_data,
-            source_url=url,
-            topic_id=topic_id,
-            cfg=cfg,
-            budget=budget,
-            bus=bus,
-        )
+        async with llm_sem:
+            await discover_links(
+                link_data=link_data,
+                source_url=url,
+                topic_id=topic_id,
+                cfg=cfg,
+                budget=budget,
+                bus=bus,
+            )
         stats.tokens_used = budget.tokens_used
         stats.cost_usd = budget.cost_usd
 
@@ -295,6 +313,9 @@ class CrawlScheduler:
         self._db_path = db_path
         self._active_tasks: set[asyncio.Task] = set()
         self._running = False
+        # Semaphores are created lazily in run() once the event loop is active.
+        self._crawl_sem: Optional[asyncio.Semaphore] = None
+        self._llm_sem: Optional[asyncio.Semaphore] = None
         self._budget = BudgetGate(
             max_tokens=cfg.budget.max_tokens_per_slice,
             max_cost_usd=cfg.budget.max_cost_per_slice_usd,
@@ -304,7 +325,13 @@ class CrawlScheduler:
     async def run(self) -> None:
         self._running = True
         self._stats.running = True
-        log.info("Scheduler started")
+        self._crawl_sem = asyncio.Semaphore(self._cfg.crawl.max_crawl_workers)
+        self._llm_sem = asyncio.Semaphore(self._cfg.crawl.max_llm_workers)
+        log.info(
+            "Scheduler started (max_crawl_workers=%d, max_llm_workers=%d)",
+            self._cfg.crawl.max_crawl_workers,
+            self._cfg.crawl.max_llm_workers,
+        )
 
         # Immediate first cycle
         await self._crawl_due_urls()
@@ -361,21 +388,28 @@ class CrawlScheduler:
             )
         )
 
+        assert self._crawl_sem is not None
+        assert self._llm_sem is not None
+
         for entry in due:
             # Capture primitive values before the session might expire
             url_id = entry.url_id
             url = entry.url
-            task = asyncio.create_task(
-                _process_url(
-                    url_id=url_id,
-                    url=url,
-                    cfg=self._cfg,
-                    topic_id=self._topic_id,
-                    bus=self._bus,
-                    stats=self._stats,
-                    budget=self._budget,
-                )
-            )
+
+            async def _guarded(uid: int = url_id, u: str = url) -> None:
+                async with self._crawl_sem:  # type: ignore[union-attr]
+                    await _process_url(
+                        url_id=uid,
+                        url=u,
+                        cfg=self._cfg,
+                        topic_id=self._topic_id,
+                        bus=self._bus,
+                        stats=self._stats,
+                        budget=self._budget,
+                        llm_sem=self._llm_sem,  # type: ignore[arg-type]
+                    )
+
+            task = asyncio.create_task(_guarded())
             self._active_tasks.add(task)
             task.add_done_callback(self._active_tasks.discard)
 

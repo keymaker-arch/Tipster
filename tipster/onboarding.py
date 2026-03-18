@@ -386,6 +386,9 @@ def _build_yaml(cfg: dict, model: str) -> str:
         "",
         "crawl:",
         "  default_delay_seconds: 1",
+        "  # Advanced: limit concurrent workers to reduce memory / API rate-limit pressure.",
+        "  # max_crawl_workers: 10  # max URLs fetched and triaged simultaneously",
+        "  # max_llm_workers: 5     # max concurrent LLM calls across all crawl tasks",
     ]
 
     return "\n".join(lines) + "\n"

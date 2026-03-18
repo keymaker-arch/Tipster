@@ -58,6 +58,7 @@ class UrlRegistry(Base):
     check_interval = Column(Integer, default=3600, nullable=False)  # seconds
     next_check_at = Column(DateTime, nullable=True)
     status = Column(String(50), default="pending", nullable=False)  # pending | active | inaccessible | blacklisted
+    recrawl_type = Column(String(20), default="periodic", nullable=False)  # periodic | one_time
     added_at = Column(DateTime, default=_now, nullable=False)
     added_by = Column(String(50), default="manual", nullable=False)  # manual | discovery | seed
 

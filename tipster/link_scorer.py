@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Optional
+from typing import NamedTuple, Optional
 from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
 
 from tipster import llm as llm_module
@@ -21,6 +21,15 @@ from tipster.budget import BudgetGate
 from tipster.config import TipsterConfig
 
 log = logging.getLogger("tipster.link_scorer")
+
+
+class ScoredLink(NamedTuple):
+    """Result of scoring one candidate link."""
+    url: str
+    score: float
+    recrawl_type: str   # "periodic" | "one_time"
+    check_interval: int  # seconds; the LLM-suggested re-crawl frequency
+
 
 # Tracking params to strip from URLs
 _TRACKING_PARAMS = frozenset({
@@ -33,11 +42,20 @@ _MAX_CANDIDATES = 40
 
 _SCORE_SYSTEM = """\
 You are a link relevance scorer for a web intelligence crawler.
-Given a topic and a list of links (URL + anchor text), score each link 0.0–1.0
-for how likely it is to lead to relevant content about the topic.
+Given a topic and a list of links (URL + anchor text), evaluate each link and return:
+
+1. "score": 0.0–1.0 — how likely the page contains relevant content about the topic
+2. "recrawl": true | false — whether this URL is a periodically-updated feed/index/listing
+   that should be re-crawled on a schedule (true), or a single static item that only needs
+   to be fetched once (false)
+3. "interval_hours": integer — estimated hours between meaningful updates (only when recrawl=true)
+   - 1–6:   live feeds, trending pages, dashboards, real-time indexes
+   - 24:    daily-updated blogs, news sites, changelogs, release pages
+   - 168:   weekly-updated sites, digests, newsletters
+   - 720:   monthly or infrequently updated resource lists
 
 Return ONLY a valid JSON array (no markdown, no prose), one object per link:
-[{"url": "<url>", "score": <0.0-1.0>}, ...]
+[{"url": "<url>", "score": <float>, "recrawl": <bool>, "interval_hours": <int>}, ...]
 
 Scoring rules:
 - 0.8-1.0: very likely to contain relevant content (topic keywords in anchor/URL)
@@ -45,6 +63,14 @@ Scoring rules:
 - 0.0-0.5: off-topic, navigation, boilerplate, ads
 - Use link_score_hints to guide scoring: 'positive' patterns → boost, 'negative' → suppress
 - If anchor text matches a negative pattern, score must be < 0.3
+
+Recrawl examples:
+- github.com/trending              → recrawl=true,  interval_hours=24
+- github.com/user/repo/issues/123  → recrawl=false
+- anthropic.com/news               → recrawl=true,  interval_hours=168
+- anthropic.com/news/specific-post → recrawl=false
+- news.ycombinator.com             → recrawl=true,  interval_hours=6
+- en.wikipedia.org/wiki/Article    → recrawl=false
 """
 
 
@@ -145,14 +171,30 @@ def _build_score_prompt(cfg: TipsterConfig, candidates: list[tuple[str, str]]) -
     )
 
 
+_MAX_INTERVAL_SECS = 30 * 24 * 3600  # 30 days ceiling
+_MIN_INTERVAL_SECS = 3600             # 1 hour floor
+
+
+def _parse_check_interval(raw_hours: object, recrawl: bool) -> int:
+    """Convert LLM-returned interval_hours to clamped seconds."""
+    if not recrawl:
+        return _MAX_INTERVAL_SECS  # won't be used, but set a safe value
+    try:
+        hours = int(raw_hours) if raw_hours is not None else 24
+    except (TypeError, ValueError):
+        hours = 24
+    return max(_MIN_INTERVAL_SECS, min(hours * 3600, _MAX_INTERVAL_SECS))
+
+
 def score_links_batch(
     candidates: list[tuple[str, str]],
     cfg: TipsterConfig,
     budget: Optional[BudgetGate] = None,
-) -> tuple[list[tuple[str, float]], bool]:
+) -> tuple[list[ScoredLink], bool]:
     """Score a batch of (url, anchor) candidates with one LLM call.
 
-    Returns (scored_list, budget_ok) where scored_list is [(url, score), ...].
+    Returns (scored_list, budget_ok).  Each ScoredLink carries relevance score,
+    recrawl classification, and the suggested check interval.
     budget_ok=False means the budget was exhausted before the call.
     """
     if not candidates:
@@ -170,7 +212,7 @@ def score_links_batch(
                 {"role": "system", "content": _SCORE_SYSTEM},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=512,
+            max_tokens=1024,
             temperature=0.1,
             api_base=cfg.llm.api_base,
         )
@@ -187,7 +229,14 @@ def score_links_batch(
 
     try:
         results = json.loads(raw)
-        scored = [(str(r["url"]), float(r["score"])) for r in results if "url" in r and "score" in r]
+        scored: list[ScoredLink] = []
+        for r in results:
+            if "url" not in r or "score" not in r:
+                continue
+            recrawl = bool(r.get("recrawl", True))  # default periodic if field missing
+            recrawl_type = "periodic" if recrawl else "one_time"
+            check_interval = _parse_check_interval(r.get("interval_hours"), recrawl)
+            scored.append(ScoredLink(str(r["url"]), float(r["score"]), recrawl_type, check_interval))
         return scored, True
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
         log.warning("Link score parse error: %s — raw: %s", exc, raw[:120])
@@ -252,26 +301,30 @@ async def discover_links(
     db = get_db()
     try:
         repo = UrlRegistryRepo(db)
-        scored_urls = {normalise_url(url) for url, _ in scored}
+        scored_urls = {normalise_url(link.url) for link in scored}
 
-        for url, score in scored:
-            if score >= threshold:
-                entry = repo.add(
+        for link in scored:
+            if link.score >= threshold:
+                repo.add(
                     topic_id=topic_id,
-                    url=url,
+                    url=link.url,
                     added_by="discovery",
-                    relevance_score=score,
+                    relevance_score=link.score,
+                    check_interval=link.check_interval,
+                    recrawl_type=link.recrawl_type,
                 )
-                if entry.added_by == "discovery" or entry.relevance_score != score:
-                    # Update score if we have a better one
-                    pass
                 added += 1
                 await bus.emit(
                     Event(
                         kind=EventKind.LINK_DISCOVERED,
-                        url=url,
-                        score=score,
-                        message=f"score={score:.2f} → queued",
+                        url=link.url,
+                        score=link.score,
+                        message=(
+                            f"score={link.score:.2f} "
+                            f"recrawl={link.recrawl_type}"
+                            + (f" every {link.check_interval // 3600}h" if link.recrawl_type == "periodic" else "")
+                            + " → queued"
+                        ),
                     )
                 )
 
@@ -325,23 +378,30 @@ async def score_pending_links(
     db = get_db()
     try:
         from tipster.db.models import UrlRegistry as UR
-        for url, score in scored:
-            url_id = pending_ids.get(url)
+        for link in scored:
+            url_id = pending_ids.get(link.url)
             if url_id is None:
                 continue
             entry = db.query(UR).filter_by(url_id=url_id).first()
             if entry is None:
                 continue
-            if score >= threshold:
+            if link.score >= threshold:
                 entry.status = "pending"
-                entry.relevance_score = score
+                entry.relevance_score = link.score
+                entry.recrawl_type = link.recrawl_type
+                entry.check_interval = link.check_interval
                 promoted += 1
                 await bus.emit(
                     Event(
                         kind=EventKind.LINK_DISCOVERED,
-                        url=url,
-                        score=score,
-                        message=f"deferred score={score:.2f} → queued",
+                        url=link.url,
+                        score=link.score,
+                        message=(
+                            f"deferred score={link.score:.2f} "
+                            f"recrawl={link.recrawl_type}"
+                            + (f" every {link.check_interval // 3600}h" if link.recrawl_type == "periodic" else "")
+                            + " → queued"
+                        ),
                     )
                 )
             else:

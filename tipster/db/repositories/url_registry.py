@@ -55,6 +55,8 @@ class UrlRegistryRepo:
         relevance_score: float = 0.5,
         source_weight: float = 0.5,
         status: str = "pending",
+        check_interval: int = 3600,
+        recrawl_type: str = "periodic",
     ) -> UrlRegistry:
         domain = urlparse(url).netloc
         existing = self.get_by_url(url)
@@ -68,6 +70,8 @@ class UrlRegistryRepo:
             source_weight=source_weight,
             added_by=added_by,
             status=status,
+            check_interval=check_interval,
+            recrawl_type=recrawl_type,
         )
         self._db.add(entry)
         self._db.commit()
