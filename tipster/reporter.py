@@ -1,14 +1,36 @@
 """Reporter Module — Phase 4.
 
-Reads all unreported, extracted content items and synthesises a Markdown
-digest + structured JSON report.  Saves to the reports table and marks
-items reported=True.
+Reads all unreported, extracted content items and assembles a Markdown digest
+plus structured JSON report deterministically — no LLM required at this stage.
+
+All the intelligence work (page-type classification, summarisation, fact
+extraction, list-item parsing) has already been done by the extractor.  The
+reporter's job is purely to format those pre-extracted results into a readable
+digest and persist them.
+
+Report structure
+----------------
+# <Topic> — Intelligence Digest
+*N finding(s) · date*
+
+## Findings   (sorted by relevance score desc, then crawl time desc)
+
+One section per content item:
+  - ★ NEW SOURCE badge if applicable
+  - Title + domain + score
+  - Per-item summary
+  - Key facts list   (articles)
+  - Items list       (lists, e.g. GitHub trending)
+
+## Report Summary
+  Counts, score range, domains covered.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 from tipster.config import TipsterConfig
@@ -20,38 +42,106 @@ from tipster.events import Event, EventBus, EventKind
 
 log = logging.getLogger("tipster.reporter")
 
-_REPORT_SYSTEM = """\
-You are an intelligence analyst synthesising a research digest for a human expert.
-You will receive a list of recently extracted web articles on a given topic.
-For each article you have: a summary, the source URL, and a relevance score.
 
-Produce a Markdown digest with:
-1. A concise **headline** (one sentence, the most important development).
-2. A **Findings** section with bullet points — one per article, formatted as:
-   - [Source domain] Brief finding (max 2 sentences).
-   Flag articles from new sources with a ★ prefix.
-3. A short **Summary** paragraph at the end tying the findings together.
-
-Be factual, concise, and attribute every claim to its source.
-Do NOT hallucinate facts not present in the provided summaries.
-"""
+def _fmt_score(score: float) -> str:
+    return f"{score:.2f}"
 
 
-def _build_report_prompt(cfg: TipsterConfig, items: list[dict]) -> str:
-    lines = [
-        f"Topic: {cfg.topic.name}",
-        f"Description: {cfg.topic.description}",
+def _render_item(item: dict) -> str:
+    """Render one content item as a Markdown section."""
+    lines: list[str] = []
+
+    new_badge = "★ **NEW SOURCE**  " if item.get("is_new_source") else ""
+    title = item.get("title") or item["url"]
+    domain = item["domain"] or item["url"]
+    score = item.get("score", 0.0)
+
+    lines.append(f"### {new_badge}{title}")
+    lines.append(f"*{domain} · relevance {_fmt_score(score)}*")
+    lines.append(f"[{item['url']}]({item['url']})")
+    lines.append("")
+
+    page_type = item.get("page_type", "article")
+    summary = item.get("summary", "")
+    if summary:
+        lines.append(summary)
+        lines.append("")
+
+    if page_type == "article":
+        key_facts = item.get("key_facts", [])
+        if key_facts:
+            lines.append("**Key facts:**")
+            for fact in key_facts:
+                lines.append(f"- {fact}")
+            lines.append("")
+        entities = item.get("entities", [])
+        if entities:
+            lines.append(f"**Entities mentioned:** {', '.join(entities)}")
+            lines.append("")
+
+    elif page_type == "list":
+        sub_items = item.get("items", [])
+        if sub_items:
+            lines.append(f"**{len(sub_items)} item(s):**")
+            for si in sub_items[:50]:  # cap display at 50 entries
+                name = si.get("name") or si.get("title") or ""
+                desc = si.get("description") or ""
+                url = si.get("url") or ""
+                # Collect any extra metadata fields
+                meta = {k: v for k, v in si.items()
+                        if k not in ("name", "title", "description", "url") and v}
+                meta_str = "  ·  ".join(f"{k}: {v}" for k, v in meta.items())
+                entry = f"- **{name}**"
+                if desc:
+                    entry += f" — {desc}"
+                if url:
+                    entry += f"  [{url}]({url})"
+                if meta_str:
+                    entry += f"  *({meta_str})*"
+                lines.append(entry)
+            lines.append("")
+
+    lines.append("---")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _build_narrative(cfg: TipsterConfig, items: list[dict], generated_at: datetime) -> str:
+    """Assemble the full Markdown digest from pre-extracted item data."""
+    date_str = generated_at.strftime("%Y-%m-%d %H:%M UTC")
+    n = len(items)
+
+    sections: list[str] = [
+        f"# {cfg.topic.name} — Intelligence Digest",
+        f"*{n} finding(s) · {date_str}*",
         "",
-        f"Articles to synthesise ({len(items)} total):",
+        "---",
+        "",
+        "## Findings",
         "",
     ]
-    for i, item in enumerate(items, 1):
-        star = "★ NEW SOURCE  " if item.get("is_new_source") else ""
-        lines.append(
-            f"[{i}] {star}Source: {item['url']}  Score: {item['score']:.2f}\n"
-            f"     Summary: {item['summary'][:400]}"
-        )
-    return "\n".join(lines)
+
+    for item in items:
+        sections.append(_render_item(item))
+
+    # Summary statistics
+    scores = [d["score"] for d in items if d.get("score") is not None]
+    domains = sorted({d["domain"] for d in items if d.get("domain")})
+    new_sources = [d for d in items if d.get("is_new_source")]
+
+    sections += [
+        "## Report Summary",
+        "",
+        f"- **Findings:** {n}",
+        f"- **Domains covered:** {len(domains)} ({', '.join(domains[:10])}{'…' if len(domains) > 10 else ''})",
+        f"- **New sources:** {len(new_sources)}",
+    ]
+    if scores:
+        sections.append(f"- **Score range:** {min(scores):.2f} – {max(scores):.2f}")
+    sections.append(f"- **Generated:** {date_str}")
+    sections.append("")
+
+    return "\n".join(sections)
 
 
 async def generate_report(
@@ -61,12 +151,10 @@ async def generate_report(
 ) -> Optional[dict]:
     """Generate a report for unreported extracted items.
 
-    Returns a dict with keys: report_id, narrative_md, report_json, items
+    Assembles the Markdown digest deterministically from already-extracted data.
+    Returns a dict with keys: report_id, narrative_md, report_json, items, item_ids
     or None if there are no unreported items.
     """
-    import asyncio
-    from functools import partial
-
     db = get_db()
     try:
         item_repo = ContentItemRepo(db)
@@ -74,56 +162,53 @@ async def generate_report(
         if not raw_items:
             return None
 
-        # Pull primitive values before closing session
         item_data: list[dict] = []
         item_ids: list[int] = []
+
         for ci in raw_items:
-            # Resolve URL via join — avoid DetachedInstanceError
-            url_row = db.query(UrlRegistry.url, UrlRegistry.domain)\
+            url_row = db.query(UrlRegistry.url, UrlRegistry.domain) \
                 .filter(UrlRegistry.url_id == ci.url_id).first()
             url = url_row.url if url_row else f"url_id={ci.url_id}"
             domain = url_row.domain if url_row else ""
+
+            # Parse the extractor's JSON output
+            extracted: dict = {}
+            if ci.extracted_json:
+                try:
+                    extracted = json.loads(ci.extracted_json)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
             item_data.append({
                 "item_id": ci.item_id,
                 "url_id": ci.url_id,
                 "url": url,
                 "domain": domain,
-                "summary": ci.article_sum_md or ci.raw_text[:300] if ci.raw_text else "(no summary)",
                 "score": ci.topic_score or 0.0,
                 "is_new_source": ci.is_new_source,
+                # Fields from extractor
+                "page_type": extracted.get("page_type", "article"),
+                "title": extracted.get("title", ""),
+                "summary": extracted.get("summary") or ci.article_sum_md or "",
+                "key_facts": extracted.get("key_facts", []),
+                "entities": extracted.get("entities", []),
+                "items": extracted.get("items", []),  # for list pages
             })
             item_ids.append(ci.item_id)
     finally:
         db.close()
 
+    # Sort: highest score first, then by item_id desc (newest)
+    item_data.sort(key=lambda d: (-d["score"], -d["item_id"]))
+
     log.info("Generating report for topic %d: %d items", topic_id, len(item_data))
 
-    # LLM synthesis
-    prompt = _build_report_prompt(cfg, item_data)
-    loop = asyncio.get_running_loop()
-    from tipster import llm as llm_module
-    try:
-        narrative_md = await loop.run_in_executor(
-            None,
-            partial(
-                llm_module.complete,
-                cfg.llm.report_model,
-                [
-                    {"role": "system", "content": _REPORT_SYSTEM},
-                    {"role": "user", "content": prompt},
-                ],
-                max_tokens=2048,
-                temperature=0.3,
-                api_base=cfg.llm.api_base,
-            ),
-        )
-    except Exception as exc:
-        log.error("Report LLM error: %s", exc)
-        return None
+    generated_at = datetime.now(timezone.utc)
+    narrative_md = _build_narrative(cfg, item_data, generated_at)
 
-    # Build structured JSON
     report_json = json.dumps({
         "topic_id": topic_id,
+        "generated_at": generated_at.isoformat(),
         "item_count": len(item_data),
         "items": [
             {
@@ -133,13 +218,18 @@ async def generate_report(
                 "domain": d["domain"],
                 "score": d["score"],
                 "is_new_source": d["is_new_source"],
+                "page_type": d["page_type"],
+                "title": d["title"],
                 "summary": d["summary"],
+                "key_facts": d["key_facts"],
+                "entities": d["entities"],
+                "items": d["items"],
             }
             for d in item_data
         ],
     }, indent=2)
 
-    # Persist to DB and mark items reported
+    # Persist and mark items reported
     db = get_db()
     try:
         report_repo = ReportRepo(db)

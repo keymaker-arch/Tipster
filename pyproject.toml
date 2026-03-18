@@ -16,6 +16,7 @@ dependencies = [
     "litellm>=1.0",
     "httpx>=0.24",
     "trafilatura>=1.6",
+    "markdownify>=0.12",
     "beautifulsoup4>=4.12",
     "python-dotenv>=1.0",
     "ruamel.yaml>=0.18",

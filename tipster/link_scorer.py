@@ -1,11 +1,16 @@
 """Link Discovery & Scoring — Phase 3.
 
-For each relevant page crawled:
-1. Pre-filter outbound links (strip known-bad, already-known, negative-hint matches)
-2. Batch-score remaining candidates with one LLM call
-3. Insert links ≥ link_score_threshold into url_registry as status='pending'
-4. When budget is exhausted mid-batch, save unscored links as status='pending_score'
-   so they are scored in the next slice instead of being silently dropped.
+Two distinct link-evaluation strategies:
+
+A) Content-aware discovery (select_links_from_content / discover_links):
+   Used when we have the full page content.  The LLM sees the page text and
+   the candidate links together and decides which links are worth following —
+   producing far fewer but higher-quality discoveries than blind URL scoring.
+
+B) URL-only scoring (score_links_batch / score_pending_links):
+   Used for links that were deferred (budget exhausted) and stored as
+   status='pending_score'.  At retry time we no longer have the source page,
+   so we fall back to scoring by URL + anchor text alone.
 """
 
 from __future__ import annotations
@@ -152,6 +157,116 @@ def _prefilter(
     return candidates, rejected
 
 
+_CONTENT_SELECT_SYSTEM = """\
+You are a link discovery agent for a web intelligence crawler.
+
+Given a page's content and its outbound links, select the links that are worth
+following to find more relevant content about the topic.
+
+For each selected link also classify:
+- "recrawl": true if the target URL is a periodically-updated feed, index, or
+  listing (e.g. a blog homepage, trending page, release list); false if it is a
+  single static item (e.g. an individual article, commit, or issue)
+- "interval_hours": estimated hours between meaningful updates (only when
+  recrawl=true): 1-6 live feeds; 24 daily; 168 weekly; 720 monthly
+
+Return ONLY a valid JSON array (no markdown, no prose):
+[{"url": "...", "recrawl": <bool>, "interval_hours": <int>}, ...]
+
+Selection rules:
+- Use the page content to understand which links lead to truly relevant content
+- For list/ranking pages: select links to individual items that seem on-topic
+- For article pages: select links to related articles or cited sources
+- Skip navigation, ads, login/signup, user-profile, and off-topic links
+- Select at most 20 links; prefer quality over quantity
+"""
+
+_CONTENT_SELECT_MAX_CHARS = 8000  # page content chars sent to the LLM for context
+
+
+def _build_content_select_prompt(
+    cfg: TipsterConfig,
+    text: str,
+    candidates: list[tuple[str, str]],
+) -> str:
+    hints = cfg.topic.relevance_hints
+    neg = cfg.topic.link_score_hints.get("negative", [])
+    links_text = "\n".join(
+        f'{i+1}. URL: {url}  Anchor: "{anchor}"'
+        for i, (url, anchor) in enumerate(candidates)
+    )
+    return (
+        f"Topic: {cfg.topic.name}\n"
+        f"Description: {cfg.topic.description}\n"
+        f"Relevance hints: {', '.join(hints)}\n"
+        f"Negative patterns (skip): {', '.join(neg)}\n\n"
+        f"--- Page content (excerpt) ---\n{text[:_CONTENT_SELECT_MAX_CHARS]}\n\n"
+        f"--- Candidate links ---\n{links_text}"
+    )
+
+
+def select_links_from_content(
+    text: str,
+    candidates: list[tuple[str, str]],
+    cfg: TipsterConfig,
+    budget: Optional[BudgetGate] = None,
+) -> tuple[list[ScoredLink], bool]:
+    """Select links to follow using full page content as context.
+
+    The LLM sees the actual page text and decides which links are relevant —
+    far more accurate than scoring by URL/anchor patterns alone.
+
+    Returns (selected_links, budget_ok).  Selected links have score=1.0
+    (the LLM already filtered them; downstream threshold checks will pass).
+    budget_ok=False means budget was exhausted before the call.
+    """
+    if not candidates:
+        return [], True
+    if budget is not None and not budget.can_proceed():
+        return [], False
+
+    prompt = _build_content_select_prompt(cfg, text, candidates)
+
+    try:
+        raw, tokens, cost = llm_module.complete_with_usage(
+            model=cfg.llm.link_score_model,
+            messages=[
+                {"role": "system", "content": _CONTENT_SELECT_SYSTEM},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=1024,
+            temperature=0.1,
+            api_base=cfg.llm.api_base,
+        )
+        if budget is not None:
+            budget.record(tokens, cost)
+    except Exception as exc:
+        log.warning("Content-aware link selection LLM error: %s", exc)
+        return [], True  # don't block progress on LLM failure
+
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
+
+    try:
+        results = json.loads(raw)
+        selected: list[ScoredLink] = []
+        candidate_urls = {normalise_url(u) for u, _ in candidates}
+        for r in results:
+            url = str(r.get("url", ""))
+            if not url or normalise_url(url) not in candidate_urls:
+                continue  # skip hallucinated URLs
+            recrawl = bool(r.get("recrawl", True))
+            recrawl_type = "periodic" if recrawl else "one_time"
+            check_interval = _parse_check_interval(r.get("interval_hours"), recrawl)
+            selected.append(ScoredLink(url, 1.0, recrawl_type, check_interval))
+        return selected, True
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        log.warning("Content-aware link selection parse error: %s — raw: %s", exc, raw[:120])
+        return [], True
+
+
 def _build_score_prompt(cfg: TipsterConfig, candidates: list[tuple[str, str]]) -> str:
     pos = cfg.topic.link_score_hints.get("positive", [])
     neg = cfg.topic.link_score_hints.get("negative", [])
@@ -244,6 +359,7 @@ def score_links_batch(
 
 
 async def discover_links(
+    text: str,
     link_data: list[tuple[str, str]],
     source_url: str,
     topic_id: int,
@@ -251,7 +367,10 @@ async def discover_links(
     budget: BudgetGate,
     bus,
 ) -> int:
-    """Score outbound links from a crawled page and register passing ones.
+    """Select outbound links to follow using the page content as context.
+
+    The LLM sees the actual page text alongside the candidate links and decides
+    which are worth crawling — far more accurate than pure URL/anchor scoring.
 
     Returns the number of new URLs added to the registry.
     """
@@ -284,53 +403,49 @@ async def discover_links(
 
     log.debug("Link discovery: %d candidates from %s", len(candidates), source_url)
 
-    # If budget exhausted, queue all candidates as pending_score
+    # If budget exhausted, queue all candidates for deferred URL-only scoring
     if not budget.can_proceed():
         await _queue_unscored(candidates, topic_id, cfg, bus)
         return 0
 
-    # Score in batches of _MAX_CANDIDATES (already limited by pre-filter, but safe)
+    # Content-aware selection: LLM sees the page text + candidates and chooses
     loop = asyncio.get_running_loop()
-    scored, budget_ok = await loop.run_in_executor(
-        None, partial(score_links_batch, candidates, cfg, budget)
+    selected, budget_ok = await loop.run_in_executor(
+        None, partial(select_links_from_content, text, candidates, cfg, budget)
     )
 
-    threshold = cfg.discovery.link_score_threshold
     added = 0
+    selected_urls = {normalise_url(link.url) for link in selected}
 
     db = get_db()
     try:
         repo = UrlRegistryRepo(db)
-        scored_urls = {normalise_url(link.url) for link in scored}
-
-        for link in scored:
-            if link.score >= threshold:
-                repo.add(
-                    topic_id=topic_id,
+        for link in selected:
+            repo.add(
+                topic_id=topic_id,
+                url=link.url,
+                added_by="discovery",
+                relevance_score=link.score,
+                check_interval=link.check_interval,
+                recrawl_type=link.recrawl_type,
+            )
+            added += 1
+            await bus.emit(
+                Event(
+                    kind=EventKind.LINK_DISCOVERED,
                     url=link.url,
-                    added_by="discovery",
-                    relevance_score=link.score,
-                    check_interval=link.check_interval,
-                    recrawl_type=link.recrawl_type,
+                    score=link.score,
+                    message=(
+                        f"recrawl={link.recrawl_type}"
+                        + (f" every {link.check_interval // 3600}h" if link.recrawl_type == "periodic" else "")
+                        + " → queued"
+                    ),
                 )
-                added += 1
-                await bus.emit(
-                    Event(
-                        kind=EventKind.LINK_DISCOVERED,
-                        url=link.url,
-                        score=link.score,
-                        message=(
-                            f"score={link.score:.2f} "
-                            f"recrawl={link.recrawl_type}"
-                            + (f" every {link.check_interval // 3600}h" if link.recrawl_type == "periodic" else "")
-                            + " → queued"
-                        ),
-                    )
-                )
+            )
 
-        # Candidates not returned by LLM or budget-exhausted mid-call → queue
+        # Candidates the LLM skipped but budget ran out mid-call → defer
         if not budget_ok:
-            unscored = [(u, a) for u, a in candidates if normalise_url(u) not in scored_urls]
+            unscored = [(u, a) for u, a in candidates if normalise_url(u) not in selected_urls]
             if unscored:
                 await _queue_unscored(unscored, topic_id, cfg, bus)
     finally:

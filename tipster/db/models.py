@@ -59,6 +59,7 @@ class UrlRegistry(Base):
     next_check_at = Column(DateTime, nullable=True)
     status = Column(String(50), default="pending", nullable=False)  # pending | active | inaccessible | blacklisted
     recrawl_type = Column(String(20), default="periodic", nullable=False)  # periodic | one_time
+    prompt_snippet = Column(Text, nullable=True)  # optional per-URL extraction hint for the LLM
     added_at = Column(DateTime, default=_now, nullable=False)
     added_by = Column(String(50), default="manual", nullable=False)  # manual | discovery | seed
 

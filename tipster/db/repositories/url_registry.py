@@ -57,6 +57,7 @@ class UrlRegistryRepo:
         status: str = "pending",
         check_interval: int = 3600,
         recrawl_type: str = "periodic",
+        prompt_snippet: str = "",
     ) -> UrlRegistry:
         domain = urlparse(url).netloc
         existing = self.get_by_url(url)
@@ -72,6 +73,7 @@ class UrlRegistryRepo:
             status=status,
             check_interval=check_interval,
             recrawl_type=recrawl_type,
+            prompt_snippet=prompt_snippet or None,
         )
         self._db.add(entry)
         self._db.commit()

@@ -154,13 +154,35 @@ async def fetch(url: str, default_delay: float = 1.0, timeout: float = 30.0) -> 
     if status >= 400:
         return CrawlResult(url=url, status_code=status)
 
-    # Extract text with trafilatura
+    # Extract page content as Markdown.
+    # trafilatura is preferred for article pages (it strips boilerplate cleanly);
+    # markdownify is used as a fallback for structured/list pages that trafilatura
+    # tends to strip too aggressively (e.g. GitHub trending, search result pages).
     text = trafilatura.extract(
         html,
         include_comments=False,
         include_tables=True,
         no_fallback=False,
+        output_format="markdown",
     ) or ""
+
+    if len(text) < 200 and html:
+        # trafilatura found little content — likely a structured/list page.
+        # Fall back to markdownify on the cleaned body for better structure
+        # preservation (headers, lists, tables all become readable Markdown).
+        try:
+            from markdownify import markdownify as _md
+            soup = BeautifulSoup(html, "html.parser")
+            for tag in soup(["script", "style", "noscript", "iframe",
+                              "nav", "footer", "header", "aside"]):
+                tag.decompose()
+            body = soup.find("body") or soup
+            text = _md(str(body), heading_style="ATX", newline_style="backslash") or ""
+            # Collapse excessive blank lines
+            import re as _re
+            text = _re.sub(r"\n{3,}", "\n\n", text).strip()
+        except Exception:
+            pass  # keep whatever trafilatura gave us
 
     # Extract outbound links
     links, link_data = _extract_links(html, url)

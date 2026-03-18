@@ -4,6 +4,12 @@ Runs extraction_model LLM on pending content items, producing:
 - extracted_json: structured facts as a JSON blob
 - article_sum_md: a concise Markdown summary of the article
 
+The LLM first classifies the page type (article | list | other) and then
+applies the appropriate extraction strategy:
+  - article: 5–10 sentence Markdown summary + key facts + entities
+  - list:    structured item-by-item extraction (trending repos, news feeds, etc.)
+  - other:   brief 2–3 sentence description
+
 Updates content_items.status from pending_extraction → extracted (or failed).
 """
 
@@ -26,32 +32,69 @@ from tipster.events import Event, EventBus, EventKind
 log = logging.getLogger("tipster.extractor")
 
 _EXTRACT_SYSTEM = """\
-You are a fact extractor for a web intelligence crawler.
-Given a topic and an article text, extract the key information and summarise it.
+You are a web content extractor for a web intelligence crawler.
 
-Return ONLY valid JSON (no markdown fences, no prose):
+STEP 1 — Classify the page type:
+- "article": a blog post, essay, news article, documentation page, or research paper
+  (primarily prose focused on a single topic or story)
+- "list": a ranking or index page containing multiple discrete items — trending
+  repositories, news feeds, search results, product listings, release notes, changelogs, etc.
+- "other": homepages, profile pages, login pages, error pages, or anything that
+  doesn't fit the above
+
+STEP 2 — Extract based on the page type:
+
+For "article":
+  Write a 5-10 sentence Markdown summary capturing the main thesis, key claims, and
+  conclusions. Include notable facts and named entities.
+
+For "list":
+  Extract every distinct item on the page as a structured object. Do NOT truncate —
+  capture all items. Include all available metadata per item (name, description, URL,
+  stars, author, language, date, score, rank, etc.).
+
+For "other":
+  Write a 2-3 sentence description of the page's purpose or content.
+
+If an extraction focus hint is provided, prioritise that aspect in your extraction.
+
+Return ONLY valid JSON (no markdown fences, no prose).
+
+Article format:
 {
-  "title": "<article title or inferred heading>",
-  "summary": "<2-4 sentence Markdown summary of what this article says>",
-  "key_facts": ["<fact1>", "<fact2>", ...],
-  "entities": ["<person/org/product name>", ...],
-  "relevance_notes": "<one sentence on why this is relevant to the topic>"
+  "page_type": "article",
+  "title": "<title or inferred heading>",
+  "summary": "<5-10 sentences in Markdown>",
+  "key_facts": ["<fact>", ...],
+  "entities": ["<person/org/project>", ...]
 }
 
-Rules:
-- summary: write in Markdown, use plain sentences, no bullet lists
-- key_facts: 3-7 specific, verifiable claims from the article
-- entities: named people, organisations, products, projects mentioned
-- Keep all fields concise
+List format:
+{
+  "page_type": "list",
+  "title": "<list title>",
+  "summary": "<1-2 sentences describing what this list is>",
+  "items": [
+    {"name": "...", "description": "...", "url": "...", <any other available metadata>},
+    ...
+  ]
+}
+
+Other format:
+{
+  "page_type": "other",
+  "title": "<title>",
+  "summary": "<2-3 sentences>"
+}
 """
 
 
-def _build_extract_prompt(cfg: TipsterConfig, text: str) -> str:
-    excerpt = text[:4000] if text else "(empty)"
+def _build_extract_prompt(cfg: TipsterConfig, text: str, prompt_snippet: str = "") -> str:
+    hint = f"\nExtraction focus: {prompt_snippet}" if prompt_snippet else ""
     return (
         f"Topic: {cfg.topic.name}\n"
-        f"Description: {cfg.topic.description}\n\n"
-        f"--- Article text ---\n{excerpt}"
+        f"Description: {cfg.topic.description}{hint}\n\n"
+        f"--- Page content ---\n{text or '(empty)'}"
     )
 
 
@@ -60,6 +103,7 @@ def extract_one(
     raw_text: str,
     cfg: TipsterConfig,
     budget: Optional[BudgetGate] = None,
+    prompt_snippet: str = "",
 ) -> tuple[bool, str]:
     """Extract facts from one content item.
 
@@ -69,7 +113,7 @@ def extract_one(
     if budget is not None and not budget.can_proceed():
         return False, "budget exhausted — deferred to next slice"
 
-    prompt = _build_extract_prompt(cfg, raw_text or "")
+    prompt = _build_extract_prompt(cfg, raw_text or "", prompt_snippet)
 
     try:
         raw, tokens, cost = llm_module.complete_with_usage(
@@ -78,7 +122,7 @@ def extract_one(
                 {"role": "system", "content": _EXTRACT_SYSTEM},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=512,
+            max_tokens=4096,
             temperature=0.2,
             api_base=cfg.llm.api_base,
         )
@@ -99,6 +143,7 @@ def extract_one(
         return False, f"JSON parse error: {raw[:80]}"
 
     extracted_json = json.dumps(parsed)
+    # summary is present for all page types; for lists it describes the list itself
     article_sum_md = parsed.get("summary", "")
     return True, json.dumps({"extracted_json": extracted_json, "article_sum_md": article_sum_md})
 
@@ -118,7 +163,7 @@ async def extract_pending(
     try:
         from tipster.db.models import ContentItem as _CI, UrlRegistry as _UR
         rows = (
-            db.query(_CI.item_id, _CI.raw_text, _UR.url)
+            db.query(_CI.item_id, _CI.raw_text, _UR.url, _UR.prompt_snippet)
             .join(_UR, _CI.url_id == _UR.url_id)
             .filter(_CI.topic_id == topic_id, _CI.status == "pending_extraction")
             .all()
@@ -129,8 +174,8 @@ async def extract_pending(
     if not rows:
         return 0
 
-    # rows is a list of (item_id, raw_text, url) named tuples — all primitives
-    pending_data = [(r.item_id, r.raw_text, r.url) for r in rows]
+    # rows is a list of named tuples — all primitives, safe after session close
+    pending_data = [(r.item_id, r.raw_text, r.url, r.prompt_snippet or "") for r in rows]
 
     await bus.emit(
         Event(
@@ -142,7 +187,7 @@ async def extract_pending(
     extracted_count = 0
     loop = asyncio.get_running_loop()
 
-    for item_id, raw_text, item_url in pending_data:
+    for item_id, raw_text, item_url, prompt_snippet in pending_data:
         if not budget.can_proceed():
             remaining = len(pending_data) - extracted_count
             await bus.emit(
@@ -155,7 +200,7 @@ async def extract_pending(
 
         success, payload = await loop.run_in_executor(
             None,
-            partial(extract_one, item_id, raw_text or "", cfg, budget),
+            partial(extract_one, item_id, raw_text or "", cfg, budget, prompt_snippet),
         )
 
         db = get_db()

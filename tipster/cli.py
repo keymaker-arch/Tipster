@@ -312,19 +312,18 @@ def cmd_start(work_dir: str) -> None:
     url_repo = UrlRegistryRepo(db)
     existing_count = url_repo.count_by_topic(topic.topic_id)
     if existing_count == 0 and cfg.seed_urls:
-        for url in cfg.seed_urls:
-            url_repo.add(topic.topic_id, url, added_by="seed")
+        for seed in cfg.seed_urls:
+            url_repo.add(topic.topic_id, seed.url, added_by="seed", prompt_snippet=seed.prompt)
         console.print(f"[green]✓ Seeded {len(cfg.seed_urls)} URL(s) from tipster.yaml[/green]")
     elif existing_count > 0:
         console.print(
             f"[dim]Resuming — {existing_count} URL(s) already in registry[/dim]"
         )
 
-    db.close()
-
     # Capture primitive values before closing session
     topic_id = topic.topic_id
     topic_name = topic.name
+    db.close()
 
     bus = EventBus()
     stats = CrawlStats()

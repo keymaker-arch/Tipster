@@ -17,6 +17,12 @@ from pydantic import BaseModel, Field, field_validator
 # Pydantic config models (mirror the tipster.yaml structure)
 # ---------------------------------------------------------------------------
 
+class SeedUrl(BaseModel):
+    """A seed URL with an optional per-URL extraction hint for the LLM."""
+    url: str
+    prompt: str = ""  # e.g. "extract each trending repo: name, stars, description"
+
+
 class TopicConfig(BaseModel):
     name: str
     description: str = ""
@@ -45,12 +51,12 @@ class BudgetConfig(BaseModel):
 
 
 class LLMConfig(BaseModel):
-    onboard_model: str = "openai/gpt-5"
-    triage_model: str = "openai/gpt-5"
-    extraction_model: str = "openai/gpt-5"
-    link_score_model: str = "openai/gpt-5"
-    report_model: str = "openai/gpt-5"
-    comment_model: str = "openai/gpt-5"
+    onboard_model: str = "openai/gpt-5.4"
+    triage_model: str = "openai/gpt-5.4"
+    extraction_model: str = "openai/gpt-5.4"
+    link_score_model: str = "openai/gpt-5.4"
+    report_model: str = "openai/gpt-5.4"  # reserved — reporter is now deterministic
+    comment_model: str = "openai/gpt-5.4"
 
     # Optional custom base URLs (read from env)
     api_base: Optional[str] = None
@@ -66,7 +72,13 @@ class CrawlConfig(BaseModel):
 
 class TipsterConfig(BaseModel):
     topic: TopicConfig
-    seed_urls: list[str] = Field(default_factory=list)
+    seed_urls: list[SeedUrl] = Field(default_factory=list)
+
+    @field_validator("seed_urls", mode="before")
+    @classmethod
+    def _normalise_seed_urls(cls, v: list) -> list:
+        """Accept plain URL strings alongside {url, prompt} dicts."""
+        return [{"url": item, "prompt": ""} if isinstance(item, str) else item for item in v]
     discovery: DiscoveryConfig = Field(default_factory=DiscoveryConfig)
     sources: SourcesConfig = Field(default_factory=SourcesConfig)
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)

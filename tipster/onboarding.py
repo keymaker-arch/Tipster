@@ -28,7 +28,7 @@ console = Console()
 # ---------------------------------------------------------------------------
 
 DEFAULT_API_BASE = "https://api-vip.codex-for.me/v1"
-DEFAULT_MODEL = "openai/gpt-5"
+DEFAULT_MODEL = "openai/gpt-5.4"
 
 
 def _env_has_valid_key(env_path: Path) -> bool:
@@ -320,6 +320,7 @@ def _build_yaml(cfg: dict, model: str) -> str:
         pad = " " * indent
         return "\n".join(f"{pad}{k}: {v}" for k, v in d.items())
 
+    # Emit seed URLs as plain strings; users can expand to {url, prompt} form manually
     seed_block = _indent_list(seed_urls, 2)
     rel_hints_block = _indent_list(relevance_hints)
     pos_block = _indent_list(link_hints.get("positive", []), 6)
@@ -354,6 +355,10 @@ def _build_yaml(cfg: dict, model: str) -> str:
     lines += [
         "",
         "seed_urls:",
+        "  # Plain string form:  - https://example.com",
+        "  # Extended form with extraction hint:",
+        "  #   - url: https://github.com/trending",
+        "  #     prompt: \"extract each trending repo: name, description, stars, language\"",
         seed_block if seed_block else "  []",
         "",
         "discovery:",

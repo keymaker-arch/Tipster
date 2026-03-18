@@ -276,6 +276,7 @@ async def _process_url(
         from tipster.link_scorer import discover_links
         async with llm_sem:
             await discover_links(
+                text=result.text,
                 link_data=link_data,
                 source_url=url,
                 topic_id=topic_id,
