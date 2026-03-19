@@ -209,21 +209,17 @@ def select_links_from_content(
     text: str,
     candidates: list[tuple[str, str]],
     cfg: TipsterConfig,
-    budget: Optional[BudgetGate] = None,
-) -> tuple[list[ScoredLink], bool]:
+) -> tuple[list[ScoredLink], int, float]:
     """Select links to follow using full page content as context.
 
     The LLM sees the actual page text and decides which links are relevant —
     far more accurate than scoring by URL/anchor patterns alone.
 
-    Returns (selected_links, budget_ok).  Selected links have score=1.0
-    (the LLM already filtered them; downstream threshold checks will pass).
-    budget_ok=False means budget was exhausted before the call.
+    Returns (selected_links, tokens_used, cost_usd).
+    Budget checking and recording are the caller's responsibility.
     """
     if not candidates:
-        return [], True
-    if budget is not None and not budget.can_proceed():
-        return [], False
+        return [], 0, 0.0
 
     prompt = _build_content_select_prompt(cfg, text, candidates)
 
@@ -238,11 +234,9 @@ def select_links_from_content(
             temperature=0.1,
             api_base=cfg.llm.api_base,
         )
-        if budget is not None:
-            budget.record(tokens, cost)
     except Exception as exc:
         log.warning("Content-aware link selection LLM error: %s", exc)
-        return [], True  # don't block progress on LLM failure
+        return [], 0, 0.0  # don't block progress on LLM failure
 
     raw = raw.strip()
     if raw.startswith("```"):
@@ -261,10 +255,10 @@ def select_links_from_content(
             recrawl_type = "periodic" if recrawl else "one_time"
             check_interval = _parse_check_interval(r.get("interval_hours"), recrawl)
             selected.append(ScoredLink(url, 1.0, recrawl_type, check_interval))
-        return selected, True
+        return selected, tokens, cost
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
         log.warning("Content-aware link selection parse error: %s — raw: %s", exc, raw[:120])
-        return [], True
+        return [], tokens, cost
 
 
 def _build_score_prompt(cfg: TipsterConfig, candidates: list[tuple[str, str]]) -> str:
@@ -304,19 +298,14 @@ def _parse_check_interval(raw_hours: object, recrawl: bool) -> int:
 def score_links_batch(
     candidates: list[tuple[str, str]],
     cfg: TipsterConfig,
-    budget: Optional[BudgetGate] = None,
-) -> tuple[list[ScoredLink], bool]:
+) -> tuple[list[ScoredLink], int, float]:
     """Score a batch of (url, anchor) candidates with one LLM call.
 
-    Returns (scored_list, budget_ok).  Each ScoredLink carries relevance score,
-    recrawl classification, and the suggested check interval.
-    budget_ok=False means the budget was exhausted before the call.
+    Returns (scored_list, tokens_used, cost_usd).
+    Budget checking and recording are the caller's responsibility.
     """
     if not candidates:
-        return [], True
-
-    if budget is not None and not budget.can_proceed():
-        return [], False
+        return [], 0, 0.0
 
     prompt = _build_score_prompt(cfg, candidates)
 
@@ -331,11 +320,9 @@ def score_links_batch(
             temperature=0.1,
             api_base=cfg.llm.api_base,
         )
-        if budget is not None:
-            budget.record(tokens, cost)
     except Exception as exc:
         log.warning("Link scoring LLM error: %s", exc)
-        return [], True  # treat as scored (don't block progress)
+        return [], 0, 0.0  # treat as scored (don't block progress)
 
     raw = raw.strip()
     if raw.startswith("```"):
@@ -352,10 +339,10 @@ def score_links_batch(
             recrawl_type = "periodic" if recrawl else "one_time"
             check_interval = _parse_check_interval(r.get("interval_hours"), recrawl)
             scored.append(ScoredLink(str(r["url"]), float(r["score"]), recrawl_type, check_interval))
-        return scored, True
+        return scored, tokens, cost
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
         log.warning("Link score parse error: %s — raw: %s", exc, raw[:120])
-        return [], True
+        return [], tokens, cost
 
 
 async def discover_links(
@@ -408,14 +395,17 @@ async def discover_links(
         await _queue_unscored(candidates, topic_id, cfg, bus)
         return 0
 
-    # Content-aware selection: LLM sees the page text + candidates and chooses
+    # Content-aware selection: LLM sees the page text + candidates and chooses.
+    # Budget is recorded here in the event loop after the executor returns —
+    # never inside the thread — so BudgetGate needs no lock.
     loop = asyncio.get_running_loop()
-    selected, budget_ok = await loop.run_in_executor(
-        None, partial(select_links_from_content, text, candidates, cfg, budget)
+    selected, tokens, cost = await loop.run_in_executor(
+        None, partial(select_links_from_content, text, candidates, cfg)
     )
+    if tokens or cost:
+        budget.record(tokens, cost)
 
     added = 0
-    selected_urls = {normalise_url(link.url) for link in selected}
 
     db = get_db()
     try:
@@ -442,12 +432,6 @@ async def discover_links(
                     ),
                 )
             )
-
-        # Candidates the LLM skipped but budget ran out mid-call → defer
-        if not budget_ok:
-            unscored = [(u, a) for u, a in candidates if normalise_url(u) not in selected_urls]
-            if unscored:
-                await _queue_unscored(unscored, topic_id, cfg, bus)
     finally:
         db.close()
 
@@ -482,10 +466,14 @@ async def score_pending_links(
     if not budget.can_proceed():
         return 0
 
+    # Budget is recorded here in the event loop after the executor returns —
+    # never inside the thread — so BudgetGate needs no lock.
     loop = asyncio.get_running_loop()
-    scored, _ = await loop.run_in_executor(
-        None, partial(score_links_batch, candidates, cfg, budget)
+    scored, tokens, cost = await loop.run_in_executor(
+        None, partial(score_links_batch, candidates, cfg)
     )
+    if tokens or cost:
+        budget.record(tokens, cost)
 
     threshold = cfg.discovery.link_score_threshold
     promoted = 0

@@ -38,6 +38,7 @@ class EventKind(str, Enum):
     CRAWL_ERROR = "crawl_error"
     TRIAGE_RELEVANT = "triage_relevant"
     TRIAGE_IRRELEVANT = "triage_irrelevant"
+    TRIAGE_DEFERRED = "triage_deferred"
     EXTRACT_START = "extract_start"
     EXTRACT_OK = "extract_ok"
     EXTRACT_DEFERRED = "extract_deferred"

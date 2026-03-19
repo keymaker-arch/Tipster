@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from tipster.db.models import UrlRegistry
@@ -101,3 +102,53 @@ class UrlRegistryRepo:
 
     def count_by_topic(self, topic_id: int) -> int:
         return self._db.query(UrlRegistry).filter(UrlRegistry.topic_id == topic_id).count()
+
+    def seconds_until_next_due(
+        self,
+        topic_id: int,
+        already_queued: frozenset[int] = frozenset(),
+    ) -> Optional[float]:
+        """Return seconds until the next unqueued URL becomes due for crawling.
+
+        Returns 0.0  if any immediately-due URL (next_check_at IS NULL or past)
+                     is not yet in already_queued — the poller should enqueue now.
+        Returns N    if the next due event is N seconds in the future.
+        Returns None if no crawlable URLs exist at all (caller should sleep for
+                     a sensible cap and try again).
+
+        already_queued must be the set of url_ids already in the crawl queue so
+        that newly discovered URLs (next_check_at=NULL) are not confused with ones
+        that have already been dispatched, which would otherwise cause a spin loop.
+        """
+        now = datetime.now(timezone.utc)
+
+        # Check for unqueued URLs that are already due (includes next_check_at=NULL,
+        # which is how newly discovered URLs arrive in the registry).
+        immediate_q = (
+            self._db.query(UrlRegistry.url_id)
+            .filter(
+                UrlRegistry.topic_id == topic_id,
+                UrlRegistry.status.in_(["pending", "active"]),
+                (UrlRegistry.next_check_at.is_(None)) | (UrlRegistry.next_check_at <= now),
+            )
+        )
+        if already_queued:
+            immediate_q = immediate_q.filter(UrlRegistry.url_id.notin_(already_queued))
+        if immediate_q.first() is not None:
+            return 0.0
+
+        # No immediately-due URLs — find when the next scheduled one arrives.
+        next_at = (
+            self._db.query(func.min(UrlRegistry.next_check_at))
+            .filter(
+                UrlRegistry.topic_id == topic_id,
+                UrlRegistry.status.in_(["pending", "active"]),
+                UrlRegistry.next_check_at > now,
+            )
+            .scalar()
+        )
+        if next_at is None:
+            return None
+        if next_at.tzinfo is None:
+            next_at = next_at.replace(tzinfo=timezone.utc)
+        return max(0.0, (next_at - now).total_seconds())

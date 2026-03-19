@@ -7,13 +7,8 @@ from __future__ import annotations
 
 import json
 import re
-from typing import TYPE_CHECKING, Optional
-
 from tipster import llm as llm_module
 from tipster.config import TipsterConfig
-
-if TYPE_CHECKING:
-    from tipster.budget import BudgetGate
 
 _TRIAGE_SYSTEM = """\
 You are a relevance filter for a web intelligence crawler.
@@ -45,18 +40,14 @@ def _build_triage_prompt(cfg: TipsterConfig, text: str) -> str:
 def triage(
     text: str,
     cfg: TipsterConfig,
-    budget: Optional["BudgetGate"] = None,
-) -> tuple[bool, float, str]:
+) -> tuple[bool, float, str, int, float]:
     """Synchronous triage call.
 
-    Returns (relevant: bool, score: float, reason: str).
-    Defers (returns False) if budget is exhausted.
+    Returns (relevant, score, reason, tokens_used, cost_usd).
+    Budget checking and recording are the caller's responsibility.
     """
     if not text or not text.strip():
-        return False, 0.0, "empty page"
-
-    if budget is not None and not budget.can_proceed():
-        return False, 0.0, "budget exhausted — deferred"
+        return False, 0.0, "empty page", 0, 0.0
 
     prompt = _build_triage_prompt(cfg, text)
 
@@ -71,10 +62,8 @@ def triage(
             temperature=0.1,
             api_base=cfg.llm.api_base,
         )
-        if budget is not None:
-            budget.record(tokens, cost)
     except Exception as exc:
-        return False, 0.0, f"LLM error: {exc}"
+        return False, 0.0, f"LLM error: {exc}", 0, 0.0
 
     raw = raw.strip()
     # Strip markdown fences
@@ -87,22 +76,25 @@ def triage(
         relevant = bool(result.get("relevant", False))
         score = float(result.get("score", 0.0))
         reason = str(result.get("reason", ""))
-        return relevant, score, reason
+        return relevant, score, reason, tokens, cost
     except (json.JSONDecodeError, KeyError, ValueError):
         # Fallback: try to parse keywords
         lower = raw.lower()
         relevant = '"relevant": true' in lower or "'relevant': true" in lower
-        return relevant, 0.5 if relevant else 0.0, raw[:100]
+        return relevant, 0.5 if relevant else 0.0, raw[:100], tokens, cost
 
 
 async def triage_async(
     text: str,
     cfg: TipsterConfig,
-    budget: Optional["BudgetGate"] = None,
-) -> tuple[bool, float, str]:
-    """Async wrapper — runs triage in thread pool to avoid blocking the event loop."""
+) -> tuple[bool, float, str, int, float]:
+    """Async wrapper — runs triage in thread pool to avoid blocking the event loop.
+
+    Budget checking must happen before calling this; budget recording must happen
+    after it returns, in the event loop (not inside the executor thread).
+    """
     import asyncio
     from functools import partial
 
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, partial(triage, text, cfg, budget))
+    return await loop.run_in_executor(None, partial(triage, text, cfg))

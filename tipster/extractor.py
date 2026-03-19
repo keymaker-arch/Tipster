@@ -35,7 +35,6 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("tipster.extractor")
 
-_POLL_INTERVAL = 30  # seconds between catch-up DB scans
 
 _EXTRACT_SYSTEM = """\
 You are a web content extractor for a web intelligence crawler.
@@ -319,17 +318,6 @@ class ExtractionWorkerPool:
         finally:
             db.close()
 
-    async def _catch_up_poller(self) -> None:
-        """Scan DB for pending_extraction items not yet in the queue.
-
-        Runs once at startup (to recover items from before this process started) then
-        every _POLL_INTERVAL seconds to catch anything missed during budget exhaustion.
-        """
-        await self._scan_pending()
-        while self._running:
-            await asyncio.sleep(_POLL_INTERVAL)
-            await self._scan_pending()
-
     async def _scan_pending(self) -> None:
         from tipster.db.models import ContentItem as _CI, UrlRegistry as _UR
         db = get_db()
@@ -359,18 +347,24 @@ class ExtractionWorkerPool:
             ))
 
     async def run(self) -> None:
-        """Start all worker coroutines and the catch-up poller.  Runs until stop() is called."""
+        """Start all worker coroutines.  Runs until stop() is called.
+
+        A one-time DB scan at startup recovers any items left in pending_extraction
+        from before this process started (e.g. after a crash or restart).  During
+        normal operation the crawler enqueues tasks directly via enqueue(), so no
+        recurring DB poll is needed.
+        """
         self._running = True
         log.info(
             "Extraction worker pool started (max_extractor_workers=%d)",
             self._max_workers,
         )
+        await self._scan_pending()
         workers = [
             asyncio.create_task(self._worker(i))
             for i in range(self._max_workers)
         ]
-        poller = asyncio.create_task(self._catch_up_poller())
-        await asyncio.gather(poller, *workers, return_exceptions=True)
+        await asyncio.gather(*workers, return_exceptions=True)
 
     def stop(self) -> None:
         self._running = False
