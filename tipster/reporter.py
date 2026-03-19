@@ -43,22 +43,14 @@ from tipster.events import Event, EventBus, EventKind
 log = logging.getLogger("tipster.reporter")
 
 
-def _fmt_score(score: float) -> str:
-    return f"{score:.2f}"
-
-
 def _render_item(item: dict) -> str:
     """Render one content item as a Markdown section."""
     lines: list[str] = []
 
-    new_badge = "★ **NEW SOURCE**  " if item.get("is_new_source") else ""
     title = item.get("title") or item["url"]
-    domain = item["domain"] or item["url"]
-    score = item.get("score", 0.0)
 
-    lines.append(f"### {new_badge}{title}")
-    lines.append(f"*{domain} · relevance {_fmt_score(score)}*")
-    lines.append(f"[{item['url']}]({item['url']})")
+    lines.append(f"### {title}")
+    lines.append(item["url"])
     lines.append("")
 
     page_type = item.get("page_type", "article")
@@ -73,10 +65,6 @@ def _render_item(item: dict) -> str:
             lines.append("**Key facts:**")
             for fact in key_facts:
                 lines.append(f"- {fact}")
-            lines.append("")
-        entities = item.get("entities", [])
-        if entities:
-            lines.append(f"**Entities mentioned:** {', '.join(entities)}")
             lines.append("")
 
     elif page_type == "list":
@@ -101,8 +89,6 @@ def _render_item(item: dict) -> str:
                 lines.append(entry)
             lines.append("")
 
-    lines.append("---")
-    lines.append("")
     return "\n".join(lines)
 
 

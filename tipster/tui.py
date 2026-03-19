@@ -134,6 +134,7 @@ class StatusPanel(Static):
         yield Label("", id="st-running")
         yield Label("", id="st-urls")
         yield Label("", id="st-extracted")
+        yield Label("", id="st-pending-review")
         yield Label("", id="st-cost")
         yield Label("", id="st-directives")
         yield Label("", id="st-sep")
@@ -175,6 +176,13 @@ class StatusPanel(Static):
         q("#st-report-interval", Label).update(f"[dim]Report[/dim]       {report_interval}")
         q("#st-last-report",     Label).update(f"[dim]Last report[/dim]  {_fmt_ago(last_report_at)}")
 
+    def update_pending_review(self, count: int) -> None:
+        label = self.query_one("#st-pending-review", Label)
+        if count > 0:
+            label.update(f"[dim]To review[/dim]    [bold cyan]{count}[/bold cyan] pending")
+        else:
+            label.update(f"[dim]To review[/dim]    —")
+
 
 # ---------------------------------------------------------------------------
 # Top-right: Working log (brief liveness indicator)
@@ -195,8 +203,7 @@ class WorkingLog(Static):
 class FindingViewer(Static):
     """Displays one finding at a time with rendered markdown, scrollable vertically.
 
-    The widget border carries the counter (border_title) and keyboard hints
-    (border_subtitle) — no inner header/footer boxes needed.
+    The widget border carries the ★ NEW SOURCE flag in border_title when applicable.
     """
 
     def compose(self) -> ComposeResult:
@@ -209,12 +216,9 @@ class FindingViewer(Static):
         self.query_one("#fv-content", Markdown).update(f"*{message}*")
         self.query_one("#fv-scroll", VerticalScroll).scroll_home(animate=False)
 
-    def show_finding(self, item: dict, position: int, total: int) -> None:
-        star = "★ NEW SOURCE  " if item.get("is_new_source") else ""
-        domain = item.get("domain") or item.get("url", "")
-        score = item.get("score", 0.0)
-        self.border_title = f" Finding {position}/{total}  {star}{domain} · {score:.2f} "
-        self.border_subtitle = " j=interesting  n=not  c <text>=comment  skip  PgUp/PgDn=scroll  history "
+    def show_finding(self, item: dict) -> None:
+        self.border_title = " ★ NEW SOURCE " if item.get("is_new_source") else ""
+        self.border_subtitle = ""
         self.query_one("#fv-content", Markdown).update(_render_item(item))
         self.query_one("#fv-scroll", VerticalScroll).scroll_home(animate=False)
 
@@ -376,6 +380,9 @@ class TipsterApp(App):
         self._current_finding: Optional[dict] = None
         # History of findings that have been reviewed in this session
         self._intel_history: list[dict] = []
+        # item_ids already queued or displayed — prevents duplicates when
+        # generate_report later emits the same items via REPORT_READY
+        self._shown_item_ids: set[int] = set()
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -388,7 +395,7 @@ class TipsterApp(App):
             yield Label("▶", id="input-prompt")
             yield Input(
                 id="conv-input",
-                placeholder="j / n / c <text> / skip / report / history / help / q",
+                placeholder="j / n / c <text> / skip / history / help / q",
             )
         yield Footer()
 
@@ -402,6 +409,7 @@ class TipsterApp(App):
         self.query_one("#conv-input", Input).focus()
         self.query_one("#finding-viewer", FindingViewer).show_idle()
         self.query_one("#history-bar", HistoryBar).refresh_history([])
+        self._refresh_pending_review_counter()
 
     def _tick_uptime(self) -> None:
         self.sub_title = f"uptime {_fmt_uptime(self._app_start_time)}"
@@ -413,18 +421,40 @@ class TipsterApp(App):
     async def _run_scheduler(self) -> None:
         await self._scheduler.run()
 
+    def _refresh_pending_review_counter(self) -> None:
+        self.query_one("#status", StatusPanel).update_pending_review(
+            len(self._pending_findings)
+        )
+
     async def _consume_events(self) -> None:
         work_log: RichLog = self.query_one("#wl-log", RichLog)
 
         while True:
             event: Event = await self._bus.receive()
 
+            if event.kind == EventKind.EXTRACT_OK and event.data:
+                work_log.write(_brief_line(event))
+                item_id = event.data.get("item_id")
+                if item_id is not None and item_id not in self._shown_item_ids:
+                    self._shown_item_ids.add(item_id)
+                    self._pending_findings.append(event.data)
+                    self._refresh_pending_review_counter()
+                    if self._current_finding is None:
+                        self._show_next_finding()
+                continue
+
             if event.kind == EventKind.REPORT_READY and event.data:
                 work_log.write(_brief_line(event))
                 items = event.data.get("items", [])
-                if items:
-                    self._pending_findings.extend(items)
-                    # If no finding is currently on screen, show the first one
+                new_items = [
+                    it for it in items
+                    if it.get("item_id") not in self._shown_item_ids
+                ]
+                for it in new_items:
+                    self._shown_item_ids.add(it["item_id"])
+                if new_items:
+                    self._pending_findings.extend(new_items)
+                    self._refresh_pending_review_counter()
                     if self._current_finding is None:
                         self._show_next_finding()
                 continue
@@ -439,16 +469,14 @@ class TipsterApp(App):
             self._current_finding = None
             n = len(self._intel_history)
             if n > 0:
-                viewer.show_idle(f"All {n} finding(s) reviewed — waiting for next report…")
+                viewer.show_idle(f"All {n} finding(s) reviewed — waiting for next finding…")
             else:
                 viewer.show_idle("Waiting for findings…")
             return
 
         self._current_finding = self._pending_findings.pop(0)
-        # position = how many reviewed + 1 (this one); total = reviewed + this + remaining
-        position = len(self._intel_history) + 1
-        total = position + len(self._pending_findings)
-        viewer.show_finding(self._current_finding, position, total)
+        self._refresh_pending_review_counter()
+        viewer.show_finding(self._current_finding)
 
     async def _refresh_stats(self) -> None:
         st: StatusPanel = self.query_one("#status", StatusPanel)
@@ -526,10 +554,6 @@ class TipsterApp(App):
             self._cmd_help()
             return
 
-        if cmd in ("report", "r"):
-            await self._cmd_report()
-            return
-
         if cmd in ("history", "hist"):
             self._cmd_history()
             return
@@ -576,8 +600,6 @@ class TipsterApp(App):
             "### Navigation\n"
             "- **history** / **hist** — show reviewed intel history\n"
             "- **PgUp** / **PgDn** — scroll the current finding (or use mouse)\n\n"
-            "### Reports\n"
-            "- **report** / **r** — trigger report generation now\n\n"
             "### Feedback on a history item\n"
             "- **\\<N\\>j** / **\\<N\\>n** / **\\<N\\>c \\<text\\>** "
             "— give feedback on history item N\n\n"
@@ -586,15 +608,6 @@ class TipsterApp(App):
             "- **q** — quit Tipster\n",
             header="[bold]HELP[/bold]",
         )
-
-    async def _cmd_report(self) -> None:
-        from tipster.reporter import generate_report
-        viewer = self.query_one("#finding-viewer", FindingViewer)
-        if self._current_finding is None:
-            viewer.show_idle("Generating report…")
-        result = await generate_report(self._topic_id, self._cfg, self._bus)
-        if result is None and self._current_finding is None:
-            viewer.show_idle("No unreported items to report yet.")
 
     def _cmd_history(self) -> None:
         viewer = self.query_one("#finding-viewer", FindingViewer)
@@ -649,7 +662,7 @@ class TipsterApp(App):
 
         if self._current_finding is None:
             viewer.show_markdown(
-                "*No active finding — wait for a report or type **report** to generate one.*",
+                "*No active finding — waiting for the next finding to be extracted.*",
                 header="[yellow]No finding[/yellow]",
             )
             return

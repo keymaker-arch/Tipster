@@ -163,7 +163,10 @@ async def extract_pending(
     try:
         from tipster.db.models import ContentItem as _CI, UrlRegistry as _UR
         rows = (
-            db.query(_CI.item_id, _CI.raw_text, _UR.url, _UR.prompt_snippet)
+            db.query(
+                _CI.item_id, _CI.url_id, _CI.raw_text, _CI.topic_score,
+                _CI.is_new_source, _UR.url, _UR.domain, _UR.prompt_snippet,
+            )
             .join(_UR, _CI.url_id == _UR.url_id)
             .filter(_CI.topic_id == topic_id, _CI.status == "pending_extraction")
             .all()
@@ -175,7 +178,11 @@ async def extract_pending(
         return 0
 
     # rows is a list of named tuples — all primitives, safe after session close
-    pending_data = [(r.item_id, r.raw_text, r.url, r.prompt_snippet or "") for r in rows]
+    pending_data = [
+        (r.item_id, r.url_id, r.raw_text, r.url, r.domain or "",
+         r.topic_score or 0.0, bool(r.is_new_source), r.prompt_snippet or "")
+        for r in rows
+    ]
 
     log.debug("EXTRACT PENDING  %d item(s) queued", len(pending_data))
     await bus.emit(
@@ -188,7 +195,7 @@ async def extract_pending(
     extracted_count = 0
     loop = asyncio.get_running_loop()
 
-    for item_id, raw_text, item_url, prompt_snippet in pending_data:
+    for item_id, url_id, raw_text, item_url, domain, score, is_new_source, prompt_snippet in pending_data:
         if not budget.can_proceed():
             remaining = len(pending_data) - extracted_count
             log.debug("EXTRACT DEFERRED  budget exhausted  remaining=%d", remaining)
@@ -234,6 +241,20 @@ async def extract_pending(
                         kind=EventKind.EXTRACT_OK,
                         url=item_url,
                         message=f"extracted item_id={item_id}",
+                        data={
+                            "item_id": item_id,
+                            "url_id": url_id,
+                            "url": item_url,
+                            "domain": domain,
+                            "score": score,
+                            "is_new_source": is_new_source,
+                            "page_type": parsed.get("page_type", "article"),
+                            "title": parsed.get("title", ""),
+                            "summary": parsed.get("summary", ""),
+                            "key_facts": parsed.get("key_facts", []),
+                            "entities": parsed.get("entities", []),
+                            "items": parsed.get("items", []),
+                        },
                     )
                 )
             else:
