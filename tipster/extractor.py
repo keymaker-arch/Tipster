@@ -156,8 +156,15 @@ async def extract_pending(
 ) -> int:
     """Process all content_items with status=pending_extraction.
 
-    Runs at the start of each crawl slice, before new crawl jobs.
+    Runs periodically from the scheduler housekeeper.
     Returns the number of items successfully extracted.
+
+    TODO: Refactor into a persistent worker-pool architecture (analogous to the
+    crawler worker pool in scheduler.py) so that extraction starts immediately
+    when a new item is saved rather than waiting for the next housekeeper tick.
+    When that refactor is done, update CrawlStats.active_extractor to reflect
+    the true number of concurrent extraction workers instead of the current
+    0-or-1 housekeeper flag.
     """
     db = get_db()
     try:

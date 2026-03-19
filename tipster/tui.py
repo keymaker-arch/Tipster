@@ -32,8 +32,7 @@ from textual.widgets import Footer, Header, Input, Label, Markdown, RichLog, Sta
 
 from tipster.config import TipsterConfig
 from tipster.db.repositories.content_items import ContentItemRepo
-from tipster.db.repositories.directives import DirectiveRepo
-from tipster.db.repositories.url_registry import UrlRegistryRepo
+from tipster.db.repositories.reports import ReportRepo
 from tipster.db.session import get_db
 from tipster.events import Event, EventBus, EventKind
 from tipster.reporter import _render_item
@@ -101,18 +100,6 @@ def _fmt_ago(dt: Optional[datetime]) -> str:
     return f"{int(diff / 3600)}h ago"
 
 
-def _fmt_in(dt: Optional[datetime]) -> str:
-    if dt is None:
-        return "—"
-    diff = (dt - datetime.now(timezone.utc)).total_seconds()
-    if diff <= 0:
-        return "now"
-    if diff < 60:
-        return f"in {int(diff)}s"
-    if diff < 3600:
-        return f"in {int(diff / 60)}m"
-    return f"in {int(diff / 3600)}h"
-
 
 def _fmt_uptime(start: datetime) -> str:
     diff = int((datetime.now(timezone.utc) - start).total_seconds())
@@ -126,62 +113,75 @@ def _fmt_uptime(start: datetime) -> str:
 # ---------------------------------------------------------------------------
 
 class StatusPanel(Static):
-    """Combined topic overview + crawl schedule."""
+    """Topic overview + live engine status."""
 
     def compose(self) -> ComposeResult:
         yield Label("STATUS", id="st-title")
         yield Label("", id="st-topic")
-        yield Label("", id="st-running")
-        yield Label("", id="st-urls")
-        yield Label("", id="st-extracted")
+        yield Label("", id="st-sep1")
+        yield Label("", id="st-crawler")
+        yield Label("", id="st-extractor")
+        yield Label("", id="st-sep2")
         yield Label("", id="st-pending-review")
-        yield Label("", id="st-cost")
-        yield Label("", id="st-directives")
-        yield Label("", id="st-sep")
-        yield Label("", id="st-last-crawl")
-        yield Label("", id="st-next-crawl")
-        yield Label("", id="st-report-interval")
+        yield Label("", id="st-reports")
         yield Label("", id="st-last-report")
+        yield Label("", id="st-crawled")
+        yield Label("", id="st-sep3")
+        yield Label("", id="st-cost")
 
     def refresh_all(
         self,
         topic_name: str,
-        running: bool,
-        urls: int,
-        extracted: int,
-        pending: int,
-        cost: float,
-        cost_limit: float,
-        directives: int,
-        last_crawl: Optional[datetime],
-        next_crawl: Optional[datetime],
-        report_interval: str,
+        active_workers: int,
+        queue_depth: int,
+        active_extractor: int,
+        extractor_pending: int,
+        crawled_total: int,
+        relevant_total: int,
+        reports_count: int,
         last_report_at: Optional[datetime],
+        session_cost_usd: float,
+        session_tokens: int,
     ) -> None:
-        status = "[green]● running[/green]" if running else "[dim]● idle[/dim]"
         q = self.query_one
-        q("#st-topic",           Label).update(f"[dim]Topic[/dim]        {topic_name}")
-        q("#st-running",         Label).update(f"[dim]Status[/dim]       {status}")
-        q("#st-urls",            Label).update(f"[dim]URLs known[/dim]   {urls}")
-        q("#st-extracted",       Label).update(
-            f"[dim]Extracted[/dim]    {extracted}  [dim]pending {pending}[/dim]"
+        q("#st-topic", Label).update(topic_name)
+
+        q("#st-sep1", Label).update("")
+
+        cw_style = "bold cyan" if active_workers > 0 else "dim"
+        q("#st-crawler", Label).update(
+            f"[dim]Crawler:[/dim]    [{cw_style}]{active_workers} active[/{cw_style}]"
+            f"  [dim]/ {queue_depth} queued[/dim]"
         )
-        q("#st-cost",            Label).update(
-            f"[dim]Cost[/dim]         ${cost:.4f} / ${cost_limit:.2f}"
+
+        ex_style = "bold cyan" if active_extractor > 0 else "dim"
+        q("#st-extractor", Label).update(
+            f"[dim]Extractor:[/dim]  [{ex_style}]{active_extractor} active[/{ex_style}]"
+            f"  [dim]/ {extractor_pending} pending[/dim]"
         )
-        q("#st-directives",      Label).update(f"[dim]Directives[/dim]   {directives}")
-        q("#st-sep",             Label).update("")
-        q("#st-last-crawl",      Label).update(f"[dim]Last crawl[/dim]   {_fmt_ago(last_crawl)}")
-        q("#st-next-crawl",      Label).update(f"[dim]Next crawl[/dim]   {_fmt_in(next_crawl)}")
-        q("#st-report-interval", Label).update(f"[dim]Report[/dim]       {report_interval}")
-        q("#st-last-report",     Label).update(f"[dim]Last report[/dim]  {_fmt_ago(last_report_at)}")
+
+        q("#st-sep2", Label).update("")
+
+        q("#st-reports",     Label).update(f"[dim]Reports:[/dim]    {reports_count}")
+        q("#st-last-report", Label).update(f"[dim]Last Report:[/dim] {_fmt_ago(last_report_at)}")
+
+        star = "[bold green]★[/bold green]"
+        q("#st-crawled", Label).update(
+            f"[dim]Crawled:[/dim]    {crawled_total}  {star} {relevant_total} relevant"
+        )
+
+        q("#st-sep3", Label).update("")
+
+        q("#st-cost", Label).update(
+            f"[dim]Cost:[/dim]       ${session_cost_usd:.4f}  [dim]·[/dim]  {session_tokens:,} tok"
+        )
 
     def update_pending_review(self, count: int) -> None:
         label = self.query_one("#st-pending-review", Label)
         if count > 0:
-            label.update(f"[dim]To review[/dim]    [bold cyan]{count}[/bold cyan] pending")
+            label.update(f"[dim]To review:[/dim]  [bold cyan]{count} pending[/bold cyan]")
         else:
-            label.update(f"[dim]To review[/dim]    —")
+            label.update(f"[dim]To review:[/dim]  —")
 
 
 # ---------------------------------------------------------------------------
@@ -484,38 +484,31 @@ class TipsterApp(App):
         while True:
             try:
                 db = get_db()
-                url_count = UrlRegistryRepo(db).count_by_topic(self._topic_id)
-                item_repo = ContentItemRepo(db)
-                extracted = (
-                    item_repo.count_by_topic(self._topic_id)
-                    - item_repo.count_pending(self._topic_id)
-                )
-                pending = item_repo.count_pending(self._topic_id)
-                directive_count = DirectiveRepo(db).count_active(self._topic_id)
-                from tipster.db.repositories.reports import ReportRepo
-                last_report = ReportRepo(db).get_last(self._topic_id)
+                extractor_pending = ContentItemRepo(db).count_pending(self._topic_id)
+                report_repo = ReportRepo(db)
+                reports_count = report_repo.count_by_topic(self._topic_id)
+                last_report = report_repo.get_last(self._topic_id)
                 last_report_at = last_report.generated_at if last_report else None
                 if last_report_at and last_report_at.tzinfo is None:
                     from datetime import timezone as _tz
                     last_report_at = last_report_at.replace(tzinfo=_tz.utc)
                 db.close()
             except Exception:
-                url_count = extracted = pending = directive_count = 0
+                extractor_pending = reports_count = 0
                 last_report_at = None
 
             st.refresh_all(
                 topic_name=self._topic_name,
-                running=self._stats.running,
-                urls=url_count,
-                extracted=extracted,
-                pending=pending,
-                cost=self._stats.cost_usd,
-                cost_limit=self._cfg.budget.max_cost_per_slice_usd,
-                directives=directive_count,
-                last_crawl=self._stats.last_crawl_at,
-                next_crawl=self._stats.next_crawl_at,
-                report_interval=self._cfg.schedule.report_interval,
+                active_workers=self._stats.active_workers,
+                queue_depth=self._stats.queue_depth,
+                active_extractor=self._stats.active_extractor,
+                extractor_pending=extractor_pending,
+                crawled_total=self._stats.crawled_total,
+                relevant_total=self._stats.relevant_total,
+                reports_count=reports_count,
                 last_report_at=last_report_at,
+                session_cost_usd=self._stats.session_cost_usd,
+                session_tokens=self._stats.session_tokens,
             )
             await asyncio.sleep(1)
 

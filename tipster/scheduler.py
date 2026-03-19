@@ -47,13 +47,20 @@ class CrawlStats:
     """Mutable stats shared between scheduler and TUI."""
 
     def __init__(self) -> None:
-        self.last_crawl_at: Optional[datetime] = None
-        self.next_crawl_at: Optional[datetime] = None
+        self.running: bool = False
+        # Crawler worker pool
+        self.active_workers: int = 0   # workers currently processing a URL
+        self.queue_depth: int = 0      # URLs waiting in the queue
+        # Extractor (single housekeeper call for now; 0 or 1)
+        # TODO: update to a true worker count once extractor is refactored into
+        # a persistent worker pool (see extractor.py: extract_pending TODO).
+        self.active_extractor: int = 0
+        # Session-level crawl progress (never reset)
         self.crawled_total: int = 0
         self.relevant_total: int = 0
-        self.tokens_used: int = 0
-        self.cost_usd: float = 0.0
-        self.running: bool = False
+        # Cumulative session cost/tokens (never reset; accumulated in housekeeper)
+        self.session_cost_usd: float = 0.0
+        self.session_tokens: int = 0
 
 
 async def _process_url(
@@ -225,9 +232,6 @@ async def _process_url(
         )
         async with llm_sem:
             relevant, score, reason = await triage_async(result.text, cfg, budget)
-        # Sync budget stats to CrawlStats for TUI display
-        stats.tokens_used = budget.tokens_used
-        stats.cost_usd = budget.cost_usd
         log.debug(
             "TRIAGE RESULT  url=%s  relevant=%s  score=%.4f  reason=%s  budget=[tokens=%d cost=$%.4f]",
             url, relevant, score, reason, budget.tokens_used, budget.cost_usd,
@@ -317,8 +321,6 @@ async def _process_url(
     finally:
         db.close()
 
-    stats.last_crawl_at = now
-
     # --- Link discovery (Phase 3) — outside the DB session ---
     if result.ok and relevant and link_data:
         log.debug("LINK DISCOVERY  source=%s  candidates=%d", url, len(link_data))
@@ -333,8 +335,6 @@ async def _process_url(
                 budget=budget,
                 bus=bus,
             )
-        stats.tokens_used = budget.tokens_used
-        stats.cost_usd = budget.cost_usd
         log.debug(
             "LINK DISCOVERY DONE  source=%s  budget=[tokens=%d cost=$%.4f]",
             url, budget.tokens_used, budget.cost_usd,
@@ -342,15 +342,15 @@ async def _process_url(
 
 
 class CrawlScheduler:
-    """Polls DB for due URLs and dispatches crawl tasks.
+    """Crawls URLs using a persistent worker pool fed by a queue.
 
-    Each slice:
-      1. Reset budget gate
-      2. Run extract_pending (process items saved in the previous slice)
-      3. Crawl all due URLs (triage budget-gated)
+    Architecture:
+      - N persistent worker coroutines pull (url_id, url) from an asyncio.Queue
+      - A DB poller periodically queries for due URLs and enqueues new ones
+      - A housekeeper runs directives, link scoring, extraction, and reports
     """
 
-    POLL_INTERVAL = 30  # seconds between scheduler ticks
+    POLL_INTERVAL = 30  # seconds between DB polls for newly due URLs
 
     def __init__(
         self,
@@ -365,10 +365,11 @@ class CrawlScheduler:
         self._bus = bus
         self._stats = stats
         self._db_path = db_path
-        self._active_tasks: set[asyncio.Task] = set()
         self._running = False
-        # Semaphores are created lazily in run() once the event loop is active.
-        self._crawl_sem: Optional[asyncio.Semaphore] = None
+        # Queue and dedup set — populated in run() once the event loop is active.
+        self._crawl_queue: asyncio.Queue[tuple[int, str]] = asyncio.Queue()
+        self._queued_url_ids: set[int] = set()
+        # LLM semaphore — created lazily in run().
         self._llm_sem: Optional[asyncio.Semaphore] = None
         self._budget = BudgetGate(
             max_tokens=cfg.budget.max_tokens_per_slice,
@@ -379,7 +380,6 @@ class CrawlScheduler:
     async def run(self) -> None:
         self._running = True
         self._stats.running = True
-        self._crawl_sem = asyncio.Semaphore(self._cfg.crawl.max_crawl_workers)
         self._llm_sem = asyncio.Semaphore(self._cfg.crawl.max_llm_workers)
         log.info(
             "Scheduler started (max_crawl_workers=%d, max_llm_workers=%d)",
@@ -387,39 +387,63 @@ class CrawlScheduler:
             self._cfg.crawl.max_llm_workers,
         )
 
-        # Immediate first cycle
-        await self._crawl_due_urls()
+        workers = [
+            asyncio.create_task(self._worker(i))
+            for i in range(self._cfg.crawl.max_crawl_workers)
+        ]
+        poller = asyncio.create_task(self._db_poller())
+        housekeeper = asyncio.create_task(self._housekeeper())
+
+        await asyncio.gather(poller, housekeeper, *workers, return_exceptions=True)
+
+    async def _worker(self, worker_id: int) -> None:
+        """Persistent worker: pulls URLs from the queue and processes them one at a time."""
+        log.debug("Worker %d started", worker_id)
+        while self._running:
+            try:
+                url_id, url = await asyncio.wait_for(self._crawl_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+
+            # Remove from dedup set immediately so the next DB poll can re-enqueue
+            # this URL if it stays due (e.g. budget was exhausted during triage).
+            self._queued_url_ids.discard(url_id)
+            self._stats.active_workers += 1
+            self._stats.queue_depth = self._crawl_queue.qsize()
+
+            try:
+                await _process_url(
+                    url_id=url_id,
+                    url=url,
+                    cfg=self._cfg,
+                    topic_id=self._topic_id,
+                    bus=self._bus,
+                    stats=self._stats,
+                    budget=self._budget,
+                    llm_sem=self._llm_sem,  # type: ignore[arg-type]
+                )
+            except Exception:
+                log.exception("Worker %d: unhandled error for url_id=%d %s", worker_id, url_id, url)
+            finally:
+                self._stats.active_workers -= 1
+                self._stats.queue_depth = self._crawl_queue.qsize()
+                self._crawl_queue.task_done()
+
+        log.debug("Worker %d stopped", worker_id)
+
+    async def _db_poller(self) -> None:
+        """Periodically scans the DB for due URLs and pushes new ones onto the queue."""
+        # Immediate first poll so crawling starts without waiting POLL_INTERVAL
+        await self._enqueue_due_urls()
 
         while self._running:
             await asyncio.sleep(self.POLL_INTERVAL)
-            await self._crawl_due_urls()
+            await self._enqueue_due_urls()
 
-    async def _crawl_due_urls(self) -> None:
-        from tipster.extractor import extract_pending
-        from tipster.link_scorer import score_pending_links
-        from tipster.directives_consumer import apply_directives
-
+    async def _enqueue_due_urls(self) -> None:
+        """Query DB for due URLs and enqueue any that are not already in the queue."""
         now = datetime.now(timezone.utc)
-        self._stats.next_crawl_at = now + timedelta(seconds=self.POLL_INTERVAL)
 
-        # Reset budget at the start of each slice
-        self._budget.reset()
-        log.debug("SLICE START  budget reset  max_tokens=%d  max_cost=$%.2f",
-                  self._cfg.budget.max_tokens_per_slice,
-                  self._cfg.budget.max_cost_per_slice_usd)
-
-        # Step 0: apply any pending directives from the previous feedback cycle
-        await apply_directives(self._topic_id, self._cfg, self._bus)
-
-        # Step 1: score any links deferred from the previous slice
-        await score_pending_links(self._topic_id, self._cfg, self._budget, self._bus)
-
-        # Step 2: extract any items left pending from a previous interrupted run
-        await extract_pending(self._cfg, self._topic_id, self._budget, self._bus)
-        self._stats.tokens_used = self._budget.tokens_used
-        self._stats.cost_usd = self._budget.cost_usd
-
-        # Step 3: crawl due URLs
         db = get_db()
         try:
             url_repo = UrlRegistryRepo(db)
@@ -431,61 +455,52 @@ class CrawlScheduler:
             await self._bus.emit(
                 Event(kind=EventKind.SCHEDULER_TICK, message="scheduler tick — no URLs due")
             )
-            # Still check for a report in case extraction in step 2 produced new items
-            await self._maybe_generate_report()
             return
 
-        await self._bus.emit(
-            Event(
-                kind=EventKind.SCHEDULER_TICK,
-                message=f"scheduler tick — {len(due)} URL(s) due [{self._budget.summary}]",
-            )
-        )
-
-        assert self._crawl_sem is not None
-        assert self._llm_sem is not None
-
-        crawl_tasks: list[asyncio.Task] = []
+        newly_queued = 0
         for entry in due:
-            # Capture primitive values before the session might expire
-            url_id = entry.url_id
-            url = entry.url
+            if entry.url_id not in self._queued_url_ids:
+                self._queued_url_ids.add(entry.url_id)
+                await self._crawl_queue.put((entry.url_id, entry.url))
+                newly_queued += 1
+        self._stats.queue_depth = self._crawl_queue.qsize()
 
-            async def _guarded(uid: int = url_id, u: str = url) -> None:
-                async with self._crawl_sem:  # type: ignore[union-attr]
-                    await _process_url(
-                        url_id=uid,
-                        url=u,
-                        cfg=self._cfg,
-                        topic_id=self._topic_id,
-                        bus=self._bus,
-                        stats=self._stats,
-                        budget=self._budget,
-                        llm_sem=self._llm_sem,  # type: ignore[arg-type]
-                    )
+        if newly_queued:
+            msg = (
+                f"scheduler tick — queued {newly_queued} new URL(s) "
+                f"(queue depth: {self._crawl_queue.qsize()}) [{self._budget.summary}]"
+            )
+        else:
+            msg = f"scheduler tick — {len(due)} URL(s) due, all already queued"
+        await self._bus.emit(Event(kind=EventKind.SCHEDULER_TICK, message=msg))
 
-            task = asyncio.create_task(_guarded())
-            self._active_tasks.add(task)
-            task.add_done_callback(self._active_tasks.discard)
-            crawl_tasks.append(task)
+    async def _housekeeper(self) -> None:
+        """Periodically runs directives, link scoring, extraction, and report generation."""
+        from tipster.extractor import extract_pending
+        from tipster.link_scorer import score_pending_links
+        from tipster.directives_consumer import apply_directives
 
-        # Wait for all crawl tasks to finish before extracting — this ensures
-        # content items saved by this batch are extracted immediately rather
-        # than waiting for the next scheduler tick.
-        log.debug("CRAWL BATCH  waiting for %d task(s) to complete", len(crawl_tasks))
-        await asyncio.gather(*crawl_tasks, return_exceptions=True)
-        log.debug("CRAWL BATCH DONE  budget=[tokens=%d cost=$%.4f]",
-                  self._budget.tokens_used, self._budget.cost_usd)
+        while self._running:
+            # Accumulate this cycle's LLM usage into session totals before reset
+            self._stats.session_cost_usd += self._budget.cost_usd
+            self._stats.session_tokens += self._budget.tokens_used
 
-        # Step 4: extract items that were just saved by this crawl batch
-        await extract_pending(self._cfg, self._topic_id, self._budget, self._bus)
-        self._stats.tokens_used = self._budget.tokens_used
-        self._stats.cost_usd = self._budget.cost_usd
-        log.debug("SLICE END  budget=[tokens=%d cost=$%.4f]",
-                  self._budget.tokens_used, self._budget.cost_usd)
+            # Reset budget for the new cycle
+            self._budget.reset()
+            log.debug("HOUSEKEEPING START  budget reset  max_tokens=%d  max_cost=$%.2f",
+                      self._cfg.budget.max_tokens_per_slice,
+                      self._cfg.budget.max_cost_per_slice_usd)
 
-        # Step 5: check if a report should be generated now that new items are extracted
-        await self._maybe_generate_report()
+            await apply_directives(self._topic_id, self._cfg, self._bus)
+            await score_pending_links(self._topic_id, self._cfg, self._budget, self._bus)
+
+            self._stats.active_extractor = 1
+            await extract_pending(self._cfg, self._topic_id, self._budget, self._bus)
+            self._stats.active_extractor = 0
+
+            await self._maybe_generate_report()
+
+            await asyncio.sleep(self.POLL_INTERVAL)
 
     async def _maybe_generate_report(self) -> None:
         """Generate a report if the configured schedule requires it."""
