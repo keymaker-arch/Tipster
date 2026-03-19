@@ -66,8 +66,9 @@ class CrawlConfig(BaseModel):
     default_delay_seconds: int = 1
     # Advanced: cap concurrent workers to avoid overwhelming the server or API.
     # Reduce these if you see rate-limit errors or high memory usage.
-    max_crawl_workers: int = 10  # max URLs fetched/triaged simultaneously
-    max_llm_workers: int = 5     # max concurrent LLM calls across all crawl tasks
+    max_crawl_workers: int = 10      # max URLs fetched/triaged simultaneously
+    max_llm_workers: int = 5         # max concurrent LLM calls across all crawl tasks
+    max_extractor_workers: int = 4   # max concurrent extraction (LLM) workers
 
 
 class TipsterConfig(BaseModel):

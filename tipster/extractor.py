@@ -19,8 +19,9 @@ import asyncio
 import json
 import logging
 import re
+from dataclasses import dataclass
 from functools import partial
-from typing import Optional
+from typing import TYPE_CHECKING, Any
 
 from tipster import llm as llm_module
 from tipster.budget import BudgetGate
@@ -29,7 +30,12 @@ from tipster.db.repositories.content_items import ContentItemRepo
 from tipster.db.session import get_db
 from tipster.events import Event, EventBus, EventKind
 
+if TYPE_CHECKING:
+    pass
+
 log = logging.getLogger("tipster.extractor")
+
+_POLL_INTERVAL = 30  # seconds between catch-up DB scans
 
 _EXTRACT_SYSTEM = """\
 You are a web content extractor for a web intelligence crawler.
@@ -102,17 +108,13 @@ def extract_one(
     item_id: int,
     raw_text: str,
     cfg: TipsterConfig,
-    budget: Optional[BudgetGate] = None,
     prompt_snippet: str = "",
-) -> tuple[bool, str]:
+) -> tuple[bool, str, int, float]:
     """Extract facts from one content item.
 
-    Returns (success: bool, message: str).
-    Caller is responsible for DB updates.
+    Returns (success, message_or_payload, tokens_used, cost_usd).
+    Budget recording and DB updates are the caller's responsibility.
     """
-    if budget is not None and not budget.can_proceed():
-        return False, "budget exhausted — deferred to next slice"
-
     prompt = _build_extract_prompt(cfg, raw_text or "", prompt_snippet)
 
     try:
@@ -126,10 +128,8 @@ def extract_one(
             temperature=0.2,
             api_base=cfg.llm.api_base,
         )
-        if budget is not None:
-            budget.record(tokens, cost)
     except Exception as exc:
-        return False, f"LLM error: {exc}"
+        return False, f"LLM error: {exc}", 0, 0.0
 
     # Strip fences
     raw = raw.strip()
@@ -140,87 +140,125 @@ def extract_one(
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
-        return False, f"JSON parse error: {raw[:80]}"
+        return False, f"JSON parse error: {raw[:80]}", tokens, cost
 
     extracted_json = json.dumps(parsed)
     # summary is present for all page types; for lists it describes the list itself
     article_sum_md = parsed.get("summary", "")
-    return True, json.dumps({"extracted_json": extracted_json, "article_sum_md": article_sum_md})
+    return True, json.dumps({"extracted_json": extracted_json, "article_sum_md": article_sum_md}), tokens, cost
 
 
-async def extract_pending(
-    cfg: TipsterConfig,
-    topic_id: int,
-    budget: BudgetGate,
-    bus: EventBus,
-) -> int:
-    """Process all content_items with status=pending_extraction.
+# ---------------------------------------------------------------------------
+# Extraction worker pool
+# ---------------------------------------------------------------------------
 
-    Runs periodically from the scheduler housekeeper.
-    Returns the number of items successfully extracted.
+@dataclass
+class ExtractTask:
+    """A unit of extraction work enqueued from a crawler worker or the catch-up poller."""
+    item_id: int
+    url_id: int
+    raw_text: str
+    url: str
+    domain: str
+    topic_score: float
+    is_new_source: bool
+    prompt_snippet: str
 
-    TODO: Refactor into a persistent worker-pool architecture (analogous to the
-    crawler worker pool in scheduler.py) so that extraction starts immediately
-    when a new item is saved rather than waiting for the next housekeeper tick.
-    When that refactor is done, update CrawlStats.active_extractor to reflect
-    the true number of concurrent extraction workers instead of the current
-    0-or-1 housekeeper flag.
+
+class ExtractionWorkerPool:
+    """Persistent worker pool that drains extraction tasks as soon as they arrive.
+
+    Workers are started alongside the crawler workers and run for the lifetime of
+    the scheduler.  The crawler enqueues a task immediately after saving a new
+    content item; a catch-up DB poller handles items that existed before startup or
+    were missed during budget exhaustion.
+
+    Budget interaction
+    ------------------
+    Workers check ``budget.can_proceed()`` before each LLM call.  When the budget is
+    exhausted the worker holds its item and polls every 5 s until the housekeeper
+    resets the budget.  ``budget.record()`` is always called from the asyncio event
+    loop (after ``run_in_executor`` returns), so no threading lock is needed — asyncio
+    is single-threaded between await points.
     """
-    db = get_db()
-    try:
-        from tipster.db.models import ContentItem as _CI, UrlRegistry as _UR
-        rows = (
-            db.query(
-                _CI.item_id, _CI.url_id, _CI.raw_text, _CI.topic_score,
-                _CI.is_new_source, _UR.url, _UR.domain, _UR.prompt_snippet,
-            )
-            .join(_UR, _CI.url_id == _UR.url_id)
-            .filter(_CI.topic_id == topic_id, _CI.status == "pending_extraction")
-            .all()
-        )
-    finally:
-        db.close()
 
-    if not rows:
-        return 0
+    def __init__(
+        self,
+        cfg: TipsterConfig,
+        topic_id: int,
+        budget: BudgetGate,
+        bus: EventBus,
+        stats: Any,          # CrawlStats — typed as Any to avoid circular import
+        max_workers: int,
+    ) -> None:
+        self._cfg = cfg
+        self._topic_id = topic_id
+        self._budget = budget
+        self._bus = bus
+        self._stats = stats
+        self._max_workers = max_workers
+        self._queue: asyncio.Queue[ExtractTask] = asyncio.Queue()
+        self._queued_ids: set[int] = set()
+        self._running = False
 
-    # rows is a list of named tuples — all primitives, safe after session close
-    pending_data = [
-        (r.item_id, r.url_id, r.raw_text, r.url, r.domain or "",
-         r.topic_score or 0.0, bool(r.is_new_source), r.prompt_snippet or "")
-        for r in rows
-    ]
+    def enqueue(self, task: ExtractTask) -> None:
+        """Enqueue an extraction task.  Silently deduplicates by item_id."""
+        if task.item_id not in self._queued_ids:
+            self._queued_ids.add(task.item_id)
+            self._queue.put_nowait(task)
 
-    log.debug("EXTRACT PENDING  %d item(s) queued", len(pending_data))
-    await bus.emit(
-        Event(
-            kind=EventKind.EXTRACT_START,
-            message=f"extracting {len(pending_data)} pending item(s)…",
-        )
-    )
+    async def _worker(self, worker_id: int) -> None:
+        log.debug("Extractor worker %d started", worker_id)
+        loop = asyncio.get_running_loop()
 
-    extracted_count = 0
-    loop = asyncio.get_running_loop()
+        while self._running:
+            # Wait for a task, checking _running every second so we can exit cleanly.
+            try:
+                task = await asyncio.wait_for(self._queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
 
-    for item_id, url_id, raw_text, item_url, domain, score, is_new_source, prompt_snippet in pending_data:
-        if not budget.can_proceed():
-            remaining = len(pending_data) - extracted_count
-            log.debug("EXTRACT DEFERRED  budget exhausted  remaining=%d", remaining)
-            await bus.emit(
-                Event(
-                    kind=EventKind.EXTRACT_DEFERRED,
-                    message=f"budget exhausted — {remaining} item(s) deferred to next slice",
+            self._queued_ids.discard(task.item_id)
+
+            # If the budget is exhausted, hold the item and wait for the housekeeper
+            # to reset it.  The item remains pending_extraction in the DB so a future
+            # restart will recover it via the catch-up poller.
+            while not self._budget.can_proceed():
+                if not self._running:
+                    self._queue.task_done()
+                    return
+                log.debug(
+                    "Extractor worker %d: budget exhausted, waiting for reset (item_id=%d)",
+                    worker_id, task.item_id,
                 )
+                await asyncio.sleep(5)
+
+            self._stats.active_extractor += 1
+            log.debug(
+                "EXTRACT START  worker=%d  item_id=%d  url=%s  text_len=%d  hint=%r",
+                worker_id, task.item_id, task.url, len(task.raw_text or ""), task.prompt_snippet,
             )
-            break
 
-        log.debug("EXTRACT START  item_id=%d  url=%s  text_len=%d  hint=%r",
-                  item_id, item_url, len(raw_text or ""), prompt_snippet or "")
-        success, payload = await loop.run_in_executor(
-            None,
-            partial(extract_one, item_id, raw_text or "", cfg, budget, prompt_snippet),
-        )
+            try:
+                success, payload, tokens, cost = await loop.run_in_executor(
+                    None,
+                    partial(extract_one, task.item_id, task.raw_text or "", self._cfg, task.prompt_snippet),
+                )
+                # Record in the event loop — no lock needed; asyncio is cooperative.
+                if tokens or cost:
+                    self._budget.record(tokens, cost)
+            except Exception as exc:
+                success, payload, tokens, cost = False, f"unhandled: {exc}", 0, 0.0
+            finally:
+                self._stats.active_extractor -= 1
+                self._queue.task_done()
 
+            await self._persist_result(task, success, payload)
+
+        log.debug("Extractor worker %d stopped", worker_id)
+
+    async def _persist_result(self, task: ExtractTask, success: bool, payload: str) -> None:
+        """Write extraction result to DB and emit an event."""
         db = get_db()
         try:
             content_repo = ContentItemRepo(db)
@@ -228,33 +266,32 @@ async def extract_pending(
                 data = json.loads(payload)
                 parsed = json.loads(data["extracted_json"])
                 content_repo.mark_extracted(
-                    item_id=item_id,
+                    item_id=task.item_id,
                     extracted_json=data["extracted_json"],
                     article_sum_md=data["article_sum_md"],
                 )
-                extracted_count += 1
                 log.debug(
                     "EXTRACT OK  item_id=%d  url=%s  page_type=%s  title=%r  "
                     "facts=%d  entities=%d  summary_len=%d",
-                    item_id, item_url,
+                    task.item_id, task.url,
                     parsed.get("page_type", "?"),
                     parsed.get("title", "")[:80],
                     len(parsed.get("key_facts", [])),
                     len(parsed.get("entities", [])),
                     len(data.get("article_sum_md", "")),
                 )
-                await bus.emit(
+                await self._bus.emit(
                     Event(
                         kind=EventKind.EXTRACT_OK,
-                        url=item_url,
-                        message=f"extracted item_id={item_id}",
+                        url=task.url,
+                        message=f"extracted item_id={task.item_id}",
                         data={
-                            "item_id": item_id,
-                            "url_id": url_id,
-                            "url": item_url,
-                            "domain": domain,
-                            "score": score,
-                            "is_new_source": is_new_source,
+                            "item_id": task.item_id,
+                            "url_id": task.url_id,
+                            "url": task.url,
+                            "domain": task.domain,
+                            "score": task.topic_score,
+                            "is_new_source": task.is_new_source,
                             "page_type": parsed.get("page_type", "article"),
                             "title": parsed.get("title", ""),
                             "summary": parsed.get("summary", ""),
@@ -265,24 +302,75 @@ async def extract_pending(
                     )
                 )
             else:
-                if "budget exhausted" in payload:
-                    # Leave as pending_extraction for next slice
-                    log.debug("EXTRACT DEFERRED (budget)  item_id=%d  url=%s", item_id, item_url)
-                else:
-                    log.debug("EXTRACT FAILED  item_id=%d  url=%s  reason=%s",
-                              item_id, item_url, payload[:120])
-                    from tipster.db.models import ContentItem as _CI
-                    db.query(_CI).filter_by(item_id=item_id).update({"status": "failed"})
-                    db.commit()
-                    await bus.emit(
-                        Event(
-                            kind=EventKind.EXTRACT_ERROR,
-                            url=item_url,
-                            message=payload[:80],
-                        )
+                log.debug(
+                    "EXTRACT FAILED  item_id=%d  url=%s  reason=%s",
+                    task.item_id, task.url, payload[:120],
+                )
+                from tipster.db.models import ContentItem as _CI
+                db.query(_CI).filter_by(item_id=task.item_id).update({"status": "failed"})
+                db.commit()
+                await self._bus.emit(
+                    Event(
+                        kind=EventKind.EXTRACT_ERROR,
+                        url=task.url,
+                        message=payload[:80],
                     )
+                )
         finally:
             db.close()
 
-    log.debug("EXTRACT PENDING DONE  extracted=%d / %d", extracted_count, len(pending_data))
-    return extracted_count
+    async def _catch_up_poller(self) -> None:
+        """Scan DB for pending_extraction items not yet in the queue.
+
+        Runs once at startup (to recover items from before this process started) then
+        every _POLL_INTERVAL seconds to catch anything missed during budget exhaustion.
+        """
+        await self._scan_pending()
+        while self._running:
+            await asyncio.sleep(_POLL_INTERVAL)
+            await self._scan_pending()
+
+    async def _scan_pending(self) -> None:
+        from tipster.db.models import ContentItem as _CI, UrlRegistry as _UR
+        db = get_db()
+        try:
+            rows = (
+                db.query(
+                    _CI.item_id, _CI.url_id, _CI.raw_text, _CI.topic_score,
+                    _CI.is_new_source, _UR.url, _UR.domain, _UR.prompt_snippet,
+                )
+                .join(_UR, _CI.url_id == _UR.url_id)
+                .filter(_CI.topic_id == self._topic_id, _CI.status == "pending_extraction")
+                .all()
+            )
+        finally:
+            db.close()
+
+        for r in rows:
+            self.enqueue(ExtractTask(
+                item_id=r.item_id,
+                url_id=r.url_id,
+                raw_text=r.raw_text or "",
+                url=r.url,
+                domain=r.domain or "",
+                topic_score=r.topic_score or 0.0,
+                is_new_source=bool(r.is_new_source),
+                prompt_snippet=r.prompt_snippet or "",
+            ))
+
+    async def run(self) -> None:
+        """Start all worker coroutines and the catch-up poller.  Runs until stop() is called."""
+        self._running = True
+        log.info(
+            "Extraction worker pool started (max_extractor_workers=%d)",
+            self._max_workers,
+        )
+        workers = [
+            asyncio.create_task(self._worker(i))
+            for i in range(self._max_workers)
+        ]
+        poller = asyncio.create_task(self._catch_up_poller())
+        await asyncio.gather(poller, *workers, return_exceptions=True)
+
+    def stop(self) -> None:
+        self._running = False

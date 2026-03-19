@@ -24,6 +24,7 @@ from tipster.db.repositories.reports import ReportRepo
 from tipster.db.repositories.url_registry import UrlRegistryRepo
 from tipster.db.session import get_db
 from tipster.events import Event, EventBus, EventKind
+from tipster.extractor import ExtractTask, ExtractionWorkerPool
 from tipster.triage import triage_async
 
 log = logging.getLogger("tipster.scheduler")
@@ -51,9 +52,7 @@ class CrawlStats:
         # Crawler worker pool
         self.active_workers: int = 0   # workers currently processing a URL
         self.queue_depth: int = 0      # URLs waiting in the queue
-        # Extractor (single housekeeper call for now; 0 or 1)
-        # TODO: update to a true worker count once extractor is refactored into
-        # a persistent worker pool (see extractor.py: extract_pending TODO).
+        # Extractor worker pool — true concurrent worker count (0 to max_extractor_workers)
         self.active_extractor: int = 0
         # Session-level crawl progress (never reset)
         self.crawled_total: int = 0
@@ -72,6 +71,7 @@ async def _process_url(
     stats: CrawlStats,
     budget: BudgetGate,
     llm_sem: asyncio.Semaphore,
+    extract_pool: ExtractionWorkerPool,
 ) -> None:
     """Fetch one URL, triage it, and persist results."""
     log.debug("FETCH  url_id=%d  %s", url_id, url)
@@ -295,6 +295,16 @@ async def _process_url(
             "SAVED  item_id=%d  url=%s  score=%.4f  is_new_source=%s  text_len=%d",
             saved_item.item_id, url, score, is_new_source, len(result.text or ""),
         )
+        extract_pool.enqueue(ExtractTask(
+            item_id=saved_item.item_id,
+            url_id=url_id,
+            raw_text=result.text or "",
+            url=url,
+            domain=entry.domain or "",
+            topic_score=score,
+            is_new_source=is_new_source,
+            prompt_snippet=entry.prompt_snippet or "",
+        ))
 
         new_interval = max(int(entry.check_interval * 0.75), 60)
         url_repo.update_after_crawl(
@@ -375,6 +385,14 @@ class CrawlScheduler:
             max_tokens=cfg.budget.max_tokens_per_slice,
             max_cost_usd=cfg.budget.max_cost_per_slice_usd,
         )
+        self._extract_pool = ExtractionWorkerPool(
+            cfg=cfg,
+            topic_id=topic_id,
+            budget=self._budget,
+            bus=bus,
+            stats=stats,
+            max_workers=cfg.crawl.max_extractor_workers,
+        )
         self._last_report_checked: Optional[datetime] = None
 
     async def run(self) -> None:
@@ -382,9 +400,10 @@ class CrawlScheduler:
         self._stats.running = True
         self._llm_sem = asyncio.Semaphore(self._cfg.crawl.max_llm_workers)
         log.info(
-            "Scheduler started (max_crawl_workers=%d, max_llm_workers=%d)",
+            "Scheduler started (max_crawl_workers=%d, max_llm_workers=%d, max_extractor_workers=%d)",
             self._cfg.crawl.max_crawl_workers,
             self._cfg.crawl.max_llm_workers,
+            self._cfg.crawl.max_extractor_workers,
         )
 
         workers = [
@@ -393,8 +412,9 @@ class CrawlScheduler:
         ]
         poller = asyncio.create_task(self._db_poller())
         housekeeper = asyncio.create_task(self._housekeeper())
+        extract_pool = asyncio.create_task(self._extract_pool.run())
 
-        await asyncio.gather(poller, housekeeper, *workers, return_exceptions=True)
+        await asyncio.gather(poller, housekeeper, extract_pool, *workers, return_exceptions=True)
 
     async def _worker(self, worker_id: int) -> None:
         """Persistent worker: pulls URLs from the queue and processes them one at a time."""
@@ -421,6 +441,7 @@ class CrawlScheduler:
                     stats=self._stats,
                     budget=self._budget,
                     llm_sem=self._llm_sem,  # type: ignore[arg-type]
+                    extract_pool=self._extract_pool,
                 )
             except Exception:
                 log.exception("Worker %d: unhandled error for url_id=%d %s", worker_id, url_id, url)
@@ -475,8 +496,7 @@ class CrawlScheduler:
         await self._bus.emit(Event(kind=EventKind.SCHEDULER_TICK, message=msg))
 
     async def _housekeeper(self) -> None:
-        """Periodically runs directives, link scoring, extraction, and report generation."""
-        from tipster.extractor import extract_pending
+        """Periodically runs directives, link scoring, and report generation."""
         from tipster.link_scorer import score_pending_links
         from tipster.directives_consumer import apply_directives
 
@@ -485,7 +505,8 @@ class CrawlScheduler:
             self._stats.session_cost_usd += self._budget.cost_usd
             self._stats.session_tokens += self._budget.tokens_used
 
-            # Reset budget for the new cycle
+            # Reset budget for the new cycle; extraction workers waiting on exhaustion
+            # will resume automatically on their next can_proceed() poll.
             self._budget.reset()
             log.debug("HOUSEKEEPING START  budget reset  max_tokens=%d  max_cost=$%.2f",
                       self._cfg.budget.max_tokens_per_slice,
@@ -493,10 +514,6 @@ class CrawlScheduler:
 
             await apply_directives(self._topic_id, self._cfg, self._bus)
             await score_pending_links(self._topic_id, self._cfg, self._budget, self._bus)
-
-            self._stats.active_extractor = 1
-            await extract_pending(self._cfg, self._topic_id, self._budget, self._bus)
-            self._stats.active_extractor = 0
 
             await self._maybe_generate_report()
 
@@ -557,3 +574,4 @@ class CrawlScheduler:
     def stop(self) -> None:
         self._running = False
         self._stats.running = False
+        self._extract_pool.stop()
